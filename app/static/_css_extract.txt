@@ -1,0 +1,12 @@
+.slot-choice{border:1px solid #d7e2e7;background:#fff;color:#526671;border-radius:8px;padding:8px;cursor:pointer;display:flex;flex-direction:column;gap:3px;align-items:center;min-height:54px}
+---
+.slot-choice b{font-size:13px;color:#17344b}
+---
+.slot-choice span{font-size:10px;color:#6f7f8c}
+---
+.slot-choice.selected{border-color:#148f83;background:#e8f7f5}
+---
+.slot-choice:disabled{cursor:not-allowed;background:#fff0f0;border-color:#f0c5c5}
+---
+.slot-choice:disabled b,.slot-choice:disabled span{color:#c94444}
+---

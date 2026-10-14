@@ -1,0 +1,179 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>服务器资产管理系统</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body data-role="{{ role }}">
+  <aside class="sidebar">
+    <div class="brand"><span class="brand-mark small">SA</span><div><b>资产管理</b><small>服务器资源中心</small></div></div>
+    <nav>
+      <button class="nav-item active" data-page="maintenance" data-capability="view_maintenance"><span>▦</span> 信息维护</button>
+      <button class="nav-item" data-page="review" data-capability="review_rack_requests"><span>✓</span> 审核管理 <i id="pendingBadge" class="badge">0</i></button>
+      <div class="nav-sub">
+        <button class="nav-sub-item" data-page="review" data-nav-review-mode="allocation" data-capability="review_rack_requests">服务器机位ip分配</button>
+        <button class="nav-sub-item" data-page="review" data-nav-review-mode="implementation" data-capability="review_rack_requests">具体实施</button>
+        <button class="nav-sub-item" data-page="review" data-nav-review-mode="operations" data-capability="review_operations">操作审核</button>
+      </div>
+      <button class="nav-item" data-page="statistics" data-capability="view_statistics"><span>▥</span> 机柜统计</button>
+      <button class="nav-item" data-page="rackRequests" data-capability="submit_rack_request"><span>⇅</span> 上下架请求</button>
+      <button class="nav-item" data-page="settings" data-capability="manage_settings"><span>⚙</span> 设置</button>
+    </nav>
+    <div class="account"><div class="avatar">{{ username[0]|upper }}</div><div><b>{{ username }}</b><small>{{ role_name }}</small></div><button id="tokenBtn" type="button" title="获取 API Token">🔑</button><form method="post" action="/logout"><button title="退出">↪</button></form></div>
+    <div id="tokenPop" class="token-pop" hidden>
+      <div class="token-pop-head"><span>API Token</span><button id="tokenClose" type="button" title="关闭">×</button></div>
+      <div id="tokenBody"></div>
+    </div>
+  </aside>
+  <main class="main">
+    <header><div><p class="eyebrow">ASSET OPERATIONS</p><h1 id="pageTitle">信息维护</h1></div><div class="status-dot"><i></i> 数据服务正常</div></header>
+
+    <section id="maintenance" class="page active">
+      <div class="hero"><div><h2>资产信息维护</h2><p>下载标准模板、批量新增数据，或对现有记录发起修改与删除申请。</p></div><div class="hero-note"><b>审核机制</b><span>所有变更审核通过后才写入正式 Excel</span></div></div>
+      <div class="entity-tabs">
+        <button class="entity-tab active" data-entity="cabinets">机柜信息</button>
+        <button class="entity-tab" data-entity="customers">客户信息</button>
+        <button class="entity-tab" data-entity="servers">服务器信息</button>
+      </div>
+      <div class="toolbar card search-panel">
+        <div class="tb-row tb-filter">
+          <div class="condition-box">
+            <div id="filterRows" class="filter-rows"></div>
+            <button id="addFilterBtn" class="btn ghost" type="button">＋ 添加条件</button>
+          </div>
+          <div class="condition-box">
+            <div id="sortRows" class="filter-rows"></div>
+            <button id="addSortBtn" class="btn ghost" type="button">＋ 添加排序</button>
+          </div>
+          <div class="tb-search-actions">
+            <button id="searchBtn" class="btn primary" type="button">⌕ 查询</button>
+            <button id="resetSearchBtn" class="btn ghost" type="button">重置</button>
+          </div>
+        </div>
+        <div class="tb-row tb-ops">
+          <div class="tb-ops-main">
+            <button id="addBtn" class="btn primary">＋ 单条新增</button>
+            <label class="btn ghost">⇧ Excel/CSV 批量新增<input id="importInput" type="file" accept=".xlsx,.csv" hidden></label>
+            <div class="dropdown" id="exportDropdown">
+              <button class="btn ghost" type="button" id="exportMenuBtn">导出 / 模板 ▾</button>
+              <div class="dropdown-menu" id="exportMenu">
+                <button id="exportXlsxBtn" type="button">导出 xlsx</button>
+                <button id="exportCsvBtn" type="button">导出 csv</button>
+                <a id="downloadXlsxTemplateBtn" href="#">模板 xlsx</a>
+                <a id="downloadCsvTemplateBtn" href="#">模板 csv</a>
+                <a id="downloadInstructionsBtn" href="/api/filling-instructions">填写说明 md</a>
+              </div>
+            </div>
+          </div>
+          <div class="tb-ops-side">
+            <button id="bulkDeleteBtn" class="btn danger" type="button" disabled>批量删除</button>
+          </div>
+        </div>
+        <div class="tb-row tb-config">
+          <div class="freeze-ctl"><span>覆盖</span><select id="importModeSelect" title="同主键记录的处理方式"><option value="full">全量覆盖</option><option value="merge">增量覆盖</option></select></div>
+          <div class="freeze-ctl"><span>冻结前</span><select id="freezeColsSelect" title="横向滚动时固定左侧列"><option value="0">不冻结</option></select><span>列</span></div>
+        </div>
+      </div>
+      <div class="table-card card"><div class="table-meta"><b id="tableName">机柜信息</b><span id="recordCount">0 条正式记录</span></div><div class="table-scroll"><table><thead id="dataHead"></thead><tbody id="dataBody"></tbody></table></div></div>
+    </section>
+
+    <section id="review" class="page">
+      <div class="hero review-hero"><div><h2>审核管理</h2><p>分别处理服务器机位IP分配、具体实施和主要信息表操作审核。</p></div></div>
+      <div class="review-filters"><button class="filter active" data-status="pending">待审核</button><button class="filter" data-status="approved">已通过</button><button class="filter" data-status="rejected">已驳回</button><button class="filter operation-only" data-status="versions">版本记录</button></div>
+      <div id="reviewSearchPanel" class="review-search card">
+        <div id="reviewFilterRows" class="filter-rows"></div>
+        <button id="addReviewFilterBtn" class="btn ghost" type="button">＋ 添加条件</button>
+        <button id="applyReviewFilterBtn" class="btn primary" type="button">⌕ 查询</button>
+        <button id="clearReviewFilterBtn" class="btn ghost" type="button">清空</button>
+      </div>
+      <div id="reviewBulkBar" class="bulk-bar card">
+        <label class="select-all"><input id="selectAllChanges" type="checkbox"> 全选</label>
+        <span id="selectedChangeCount">已选 0 条</span>
+        <div class="bulk-actions">
+          <button id="bulkRejectBtn" class="btn danger" type="button" disabled>批量驳回</button>
+          <button id="bulkApproveBtn" class="btn primary" type="button" disabled>批量通过</button>
+          <button id="bulkExportBtn" class="btn ghost" type="button" disabled>导出 xlsx</button>
+        </div>
+      </div>
+      <div id="reviewList" class="review-list"></div>
+    </section>
+
+    <section id="statistics" class="page">
+      <div class="hero stats-hero"><div><h2>机柜资源视图</h2><p>按机房和机柜查看机位占用、服务器信息及客户归属。</p></div><div class="search-wrap light"><span>⌕</span><input id="statsSearch" placeholder="筛选机柜、IP、客户..."></div></div>
+      <div id="statCards" class="stat-cards"></div>
+      <div id="cabinetGrid" class="cabinet-grid"></div>
+    </section>
+
+    <section id="rackRequests" class="page">
+      <div class="hero"><div><h2>上下架请求</h2><p>提交服务器上架或下架需求，提单人由系统自动记录。</p></div></div>
+      <div class="table-actions">
+        <a class="btn ghost" id="rackRequestXlsxTemplateBtn" href="/api/rack-requests/template?format=xlsx">下载 xlsx 模板</a>
+        <a class="btn ghost" id="rackRequestCsvTemplateBtn" href="/api/rack-requests/template?format=csv">下载 csv 模板</a>
+        <label class="btn primary">导入上下架表<input id="rackRequestImportInput" type="file" accept=".xlsx,.csv" hidden></label>
+      </div>
+      <form id="rackRequestForm" class="card form-grid rack-request-form">
+        <label>序列号 *<input name="序列号" required></label>
+        <label>品牌<input name="品牌"></label>
+        <label>型号<input name="型号"></label>
+        <label>CPU型号<input name="CPU型号"></label>
+        <label>网卡<input name="网卡"></label>
+        <label>服务器成本(万)<input name="服务器成本(万)"></label>
+        <label>资源申请编号<input name="资源申请编号"></label>
+        <label>是否液冷<input name="是否液冷"></label>
+        <label>是否上架 *<select name="是否上架"><option>是</option><option>否</option></select></label>
+        <label>是否重装系统 *<select name="是否重装系统" required><option>是</option><option>否</option></select></label>
+        <label>初始密码<input name="初始密码"></label>
+        <label>客户id *<input name="客户id" list="customerIdOptions" data-customer-id required></label>
+        <label>客户名称<input name="客户名称" list="customerNameOptions" data-customer-name></label>
+        <label>所在机房 *<input name="所在机房" required></label>
+        <label class="wide">防火墙白名单<textarea name="防火墙白名单"></textarea></label>
+        <label class="wide">上下架需求<textarea name="上下架需求"></textarea></label>
+        <label class="wide">备注<textarea name="备注"></textarea></label>
+        <div class="modal-actions wide"><button class="btn ghost" id="rackRequestCancelEditBtn" type="button" hidden>取消修改</button><button class="btn primary" id="rackRequestSubmitBtn" type="submit">提交上下架请求</button></div>
+      </form>
+      <div id="rackRequestStatusTabs" class="review-filters rack-request-tabs">
+        <button class="filter active" data-rack-request-status="pending">待审核</button>
+        <button class="filter" data-rack-request-status="rejected">已驳回</button>
+        <button class="filter" data-rack-request-status="approved">已通过</button>
+      </div>
+      <div id="rackRequestSearchPanel" class="review-search card">
+        <div id="rackRequestFilterRows" class="filter-rows"></div>
+        <button id="addRackRequestFilterBtn" class="btn ghost" type="button">＋ 添加条件</button>
+        <button id="applyRackRequestFilterBtn" class="btn primary" type="button">⌕ 查询</button>
+        <button id="clearRackRequestFilterBtn" class="btn ghost" type="button">清空</button>
+      </div>
+      <div class="table-meta no-border"><b id="rackRequestListTitle">我的待审核请求</b><span id="rackRequestListHint">仅展示当前用户提交且尚未进入审批流的请求</span></div>
+      <div id="rackRequestList" class="review-list"></div>
+    </section>
+
+    <section id="settings" class="page">
+      <div class="hero"><div><h2>设置</h2><p>配置备份策略、审核保留数量和系统用户。</p></div></div>
+      <form id="settingsForm" class="card form-grid">
+        <label>备份副本数<input id="backupKeepCount" name="backup_keep_count" type="number" min="0"></label>
+        <label>审核状态保存上限<input id="auditKeepCount" name="audit_keep_count" type="number" min="0"></label>
+        <label>启用通知<input id="notifyEnabled" name="notify_enabled" type="checkbox" value="1"></label>
+        <label>通知格式<select id="notifyMessageType" name="notify_message_type"><option value="markdown">markdown</option><option value="text">text</option></select></label>
+        <label class="wide">备份后命令<input id="backupCommand" name="backup_command"></label>
+        <label class="wide">通知 Webhook URL<input id="notifyWebhookUrl" name="notify_webhook_url" placeholder="https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=..."></label>
+        <div class="modal-actions wide"><button class="btn danger" id="resetFlowStateBtn" type="button">重置流程状态</button><button class="btn ghost" id="manualBackupBtn" type="button">手动备份</button><button class="btn primary" type="submit">保存设置</button></div>
+      </form>
+      <div class="table-card card">
+        <div class="table-meta"><b>用户管理</b><button id="addSystemUserBtn" class="btn ghost" type="button">＋ 添加用户</button></div>
+        <div class="table-scroll"><table id="systemUsersTable"><thead><tr><th>用户id</th><th>密码</th><th>身份</th><th>业务单位</th><th>所属机房</th><th>操作</th></tr></thead><tbody id="systemUsersBody"></tbody></table></div>
+        <div class="modal-actions"><button id="saveSystemUsersBtn" class="btn primary" type="button">保存用户配置</button></div>
+      </div>
+    </section>
+  </main>
+
+  <datalist id="customerIdOptions" data-customer-id-options></datalist>
+  <datalist id="customerNameOptions" data-customer-name-options></datalist>
+  <div id="modal" class="modal"><div class="modal-panel"><div class="modal-head"><div><p class="eyebrow" id="modalEyebrow">NEW RECORD</p><h2 id="modalTitle">新增记录</h2></div><button id="closeModal">×</button></div><form id="recordForm"><div id="formFields" class="form-grid"></div><div class="modal-actions"><button type="button" class="btn ghost" id="cancelModal">取消</button><button type="submit" class="btn primary">提交审核</button></div></form></div></div>
+  <div id="toast" class="toast"></div>
+  <script>
+    window.APP_ROLE={{ role|tojson }};
+    window.APP_USER={{ app_user|tojson }};
+    window.APP_CAPABILITIES={{ capabilities|tojson }};
+  </script>
+  <script src="{{ url_for('static', filename='app.js') }}"></script>
+</body></html>

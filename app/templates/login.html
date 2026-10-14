@@ -1,0 +1,23 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>服务器资产管理系统 - 登录</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body class="login-body">
+  <main class="login-card">
+    <div class="brand-mark">SA</div>
+    <p class="eyebrow">SERVER ASSET</p>
+    <h1>服务器资产管理系统</h1>
+    <p class="muted">统一维护机柜、客户与服务器资产</p>
+    {% if error %}<div class="alert error">{{ error }}</div>{% endif %}
+    <form method="post" class="login-form">
+      <label>用户名<input name="username" autocomplete="username" required autofocus></label>
+      <label>密码<input name="password" type="password" autocomplete="current-password" required></label>
+      <button class="btn primary wide" type="submit">登录系统</button>
+    </form>
+  </main>
+</body>
+</html>
+
