@@ -1,6 +1,6 @@
 const APP_CAPABILITIES = window.APP_CAPABILITIES || [];
 const APP_USER = window.APP_USER || {};
-const SERVER_APPROVAL_HEADERS = ['序列号', '品牌', '型号', 'CPU型号', '网卡', '服务器成本(万)', '归属单位', '用途分类', '用途', '防火墙白名单', '资源申请编号', '是否液冷', '客户id', '客户名称', '所在机房', '所属机柜', '所属机位', '管理ip', '交易ip', '带外ip', '管理密码', '带外密码', '上架时间', '接入行情', '接入柜台'];
+const SERVER_APPROVAL_HEADERS = ['序列号', '品牌', '型号', 'CPU型号', '网卡', '服务器成本(万)', '归属单位', '用途分类', '用途', '防火墙白名单', '资源申请编号', '是否液冷', '客户id', '客户名称', '所在机房', '所属机柜', '所属机位', '管理ip', '交易ip', '带外ip', '管理密码', '带外密码', '上架时间', '接入行情', '接入柜台', '备注'];
 const RACK_REVIEW_FILTER_FIELDS = ['序列号', '客户id', '客户名称', '所在机房'];
 const state = { entity: 'cabinets', records: [], meta: null, editing: null, pendingEditing: null, rackEditing: null, rackRequestStatus: 'pending', status: 'pending', reviewMode: 'allocation', stats: null, filters: [], sorts: [], reviewFilters: [], rackRequestFilters: [], changes: [], rackRequests: [], rackApprovalOptions: { rooms: [] }, rackSlotPick: {}, rackRequestExpanded: [], rackReviewExpanded: [], systemUsers: [], customerOptions: [] };
 const $ = s => document.querySelector(s);
@@ -63,6 +63,27 @@ function customerInput(field, value = '', extra = '') {
   const listId = field === '客户id' ? 'customerIdOptions' : 'customerNameOptions';
   const marker = field === '客户id' ? 'data-customer-id' : 'data-customer-name';
   return `<input name="${esc(field)}" value="${esc(value || '')}" list="${listId}" ${marker} ${extra}>`;
+}
+
+// 长文本字段：在编辑/审批表单中渲染为可调整大小的多行编辑框（textarea）
+const MULTILINE_FIELDS = ['防火墙白名单', '备注'];
+
+function isMultilineField(field) {
+  return MULTILINE_FIELDS.includes(field);
+}
+
+// 统一字段控件：多行字段 -> textarea（可拖拽调整大小），其余 -> 单行 input
+function textFieldInput(field, value = '', extra = '') {
+  const text = value ?? '';
+  if (isMultilineField(field)) {
+    return `<textarea name="${esc(field)}" rows="4"${extra}>${esc(text)}</textarea>`;
+  }
+  return `<input name="${esc(field)}" value="${esc(text)}"${extra}>`;
+}
+
+// 多行字段的 label 需独占整行，避免编辑框被网格压窄
+function fieldLabelClass(field) {
+  return isMultilineField(field) ? ' class="multiline"' : '';
 }
 
 function bindCustomerInputs(root = document) {
@@ -426,10 +447,184 @@ function updateRowSelection() {
   }
 }
 
+/* ==== 可搜索的字段选择框（查询条件 / 排序条件里的字段选择） ==== */
+// 渲染一个带搜索的字段选择框：输入框负责输入关键词，data-value 保存已选字段
+function fieldComboHtml(field, options) {
+  const items = options.map(option => `<button type="button" class="combo-option${option === field ? ' on' : ''}" data-value="${esc(option)}" role="option">${esc(option)}</button>`).join('');
+  return `<div class="field-combo" data-combo data-value="${esc(field)}">` +
+    `<input class="combo-input" type="text" value="${esc(field)}" placeholder="输入以搜索字段" autocomplete="off" spellcheck="false" role="combobox" aria-expanded="false" aria-autocomplete="list">` +
+    '<span class="combo-caret" aria-hidden="true">▾</span>' +
+    `<div class="combo-menu" role="listbox" hidden>${items}<div class="combo-empty" hidden>无匹配字段</div></div>` +
+    '</div>';
+}
+
+function comboInput(el) {
+  return el ? el.querySelector('.combo-input') : null;
+}
+
+function comboOptions(el) {
+  return el ? [...el.querySelectorAll('.combo-option')] : [];
+}
+
+function comboValue(el) {
+  return el?.dataset.value || '';
+}
+
+// 模糊匹配：忽略空格与大小写，按“包含”匹配（如 管理ip → 管理ip / 管理密码）
+function comboMatch(text, query) {
+  const flat = value => String(value ?? '').replace(/\s+/g, '').toLowerCase();
+  const q = flat(query);
+  return !q || flat(text).includes(q);
+}
+
+function setActiveComboOption(el, value) {
+  let active = null;
+  comboOptions(el).forEach(option => {
+    const on = !!value && option.dataset.value === value;
+    option.classList.toggle('active', on);
+    if (on) active = option;
+  });
+  if (active) { try { active.scrollIntoView({ block: 'nearest' }); } catch {} }
+}
+
+function activeComboOption(el) {
+  return el ? el.querySelector('.combo-option.active:not([hidden])') : null;
+}
+
+// 按关键词过滤候选项；无关键词时恢复全部并高亮当前已选字段
+function filterFieldCombo(el, query) {
+  const options = comboOptions(el);
+  const matched = options.filter(option => comboMatch(option.dataset.value, query));
+  options.forEach(option => { option.hidden = !matched.includes(option); });
+  const empty = el.querySelector('.combo-empty');
+  if (empty) empty.hidden = matched.length > 0;
+  const target = matched.find(option => option.dataset.value === comboValue(el)) || matched[0];
+  setActiveComboOption(el, target ? target.dataset.value : '');
+}
+
+function openFieldCombo(el) {
+  if (!el) return;
+  closeFieldCombos(el);
+  el.classList.add('open');
+  const menu = el.querySelector('.combo-menu');
+  if (menu) menu.hidden = false;
+  const input = comboInput(el);
+  if (input) input.setAttribute('aria-expanded', 'true');
+  filterFieldCombo(el, '');
+}
+
+// revert=true 时把未提交的输入还原为已选字段（放弃这次搜索）
+function closeFieldCombo(el, revert = true) {
+  if (!el) return;
+  const input = comboInput(el);
+  if (revert && input) input.value = comboValue(el);
+  el.classList.remove('open');
+  const menu = el.querySelector('.combo-menu');
+  if (menu) menu.hidden = true;
+  if (input) input.setAttribute('aria-expanded', 'false');
+  comboOptions(el).forEach(option => option.classList.remove('active'));
+}
+
+function closeFieldCombos(keep) {
+  $$('[data-combo]').forEach(el => {
+    if (el === keep || !el.classList.contains('open')) return;
+    closeFieldCombo(el);
+  });
+}
+
+function chooseFieldCombo(el, value) {
+  if (!el || !value || !comboOptions(el).some(option => option.dataset.value === value)) return;
+  el.dataset.value = value;
+  comboOptions(el).forEach(option => option.classList.toggle('on', option.dataset.value === value));
+  const input = comboInput(el);
+  if (input) input.value = value;
+  closeFieldCombo(el, false);
+}
+
+function moveActiveComboOption(el, step) {
+  const visible = comboOptions(el).filter(option => !option.hidden);
+  if (!visible.length) return;
+  const current = visible.findIndex(option => option.classList.contains('active'));
+  const next = current < 0 ? (step > 0 ? 0 : visible.length - 1) : (current + step + visible.length) % visible.length;
+  setActiveComboOption(el, visible[next].dataset.value);
+}
+
+function bindFieldCombos() {
+  document.addEventListener('focusin', event => {
+    const el = event.target.closest?.('[data-combo]');
+    if (!el) { closeFieldCombos(null); return; }
+    const input = comboInput(el);
+    openFieldCombo(el);
+    // 聚焦即全选，直接输入关键词即可替换当前字段
+    if (input && event.target === input && typeof input.select === 'function') input.select();
+  });
+
+  document.addEventListener('input', event => {
+    const el = event.target.closest?.('[data-combo]');
+    if (!el || !event.target.classList.contains('combo-input')) return;
+    if (!el.classList.contains('open')) openFieldCombo(el);
+    filterFieldCombo(el, event.target.value);
+  });
+
+  document.addEventListener('keydown', event => {
+    const el = event.target.closest?.('[data-combo]');
+    if (!el || !event.target.classList.contains('combo-input')) return;
+    const key = event.key;
+    if (key === 'ArrowDown' || key === 'ArrowUp') {
+      event.preventDefault();
+      if (!el.classList.contains('open')) openFieldCombo(el);
+      moveActiveComboOption(el, key === 'ArrowDown' ? 1 : -1);
+    } else if (key === 'Enter') {
+      event.preventDefault();
+      const active = activeComboOption(el);
+      const typed = String(event.target.value || '').trim();
+      const exact = comboOptions(el).find(option => option.dataset.value === typed);
+      chooseFieldCombo(el, active?.dataset.value || exact?.dataset.value || '');
+    } else if (key === 'Escape') {
+      event.preventDefault();
+      closeFieldCombo(el);
+    }
+  });
+
+  // mousedown 早于 blur：先锁定选择再收起，避免焦点跳走把输入还原
+  document.addEventListener('mousedown', event => {
+    const caret = event.target.closest?.('.combo-caret');
+    if (caret) {
+      event.preventDefault();
+      const el = caret.closest('[data-combo]');
+      if (el.classList.contains('open')) closeFieldCombo(el);
+      else openFieldCombo(el);
+      comboInput(el)?.focus({ preventScroll: true });
+      return;
+    }
+    const option = event.target.closest?.('.combo-option');
+    if (!option) return;
+    const el = option.closest('[data-combo]');
+    // 不主动 focus：preventDefault 已保住焦点，避免 focusin 把刚收起的菜单又弹开
+    event.preventDefault();
+    chooseFieldCombo(el, option.dataset.value);
+  });
+
+  document.addEventListener('click', event => {
+    const el = event.target.closest?.('[data-combo]');
+    if (!el) { closeFieldCombos(null); return; }
+    // 输入框已被聚焦时再次点击不会触发 focusin，需要显式展开
+    if (event.target.classList.contains('combo-input') && !el.classList.contains('open')) openFieldCombo(el);
+  });
+
+  document.addEventListener('focusout', event => {
+    const el = event.target.closest?.('[data-combo]');
+    if (!el) return;
+    const next = event.relatedTarget;
+    if (next && el.contains(next)) return;
+    closeFieldCombo(el);
+  });
+}
+
 function renderFilters() {
   if (!state.meta || !$('#filterRows')) return;
   const rows = state.filters.length ? state.filters : [{ field: state.meta.headers[0], pattern: '' }];
-  $('#filterRows').innerHTML = rows.map((filter, index) => `<div class="filter-row" data-index="${index}"><select>${filterFields().map(h => `<option value="${esc(h)}"${h === filter.field ? ' selected' : ''}>${esc(h)}</option>`).join('')}</select><input value="${esc(filter.pattern || '')}" placeholder="正则表达式，例如 ^Dell$"><button class="mini delete" type="button" onclick="removeFilter(${index})">删除</button></div>`).join('');
+  $('#filterRows').innerHTML = rows.map((filter, index) => `<div class="filter-row" data-index="${index}">${fieldComboHtml(filter.field, filterFields())}<input data-pattern value="${esc(filter.pattern || '')}" placeholder="正则表达式，例如 ^Dell$"><button class="mini delete" type="button" onclick="removeFilter(${index})">删除</button></div>`).join('');
 }
 
 function filterFields() {
@@ -438,8 +633,8 @@ function filterFields() {
 
 function collectFilters() {
   return $$('#filterRows .filter-row').map(row => {
-    const field = row.querySelector('select')?.value || '';
-    const pattern = row.querySelector('input')?.value.trim() || '';
+    const field = comboValue(row.querySelector('[data-combo]'));
+    const pattern = row.querySelector('[data-pattern]')?.value.trim() || '';
     return { field, pattern };
   }).filter(item => item.field && item.pattern);
 }
@@ -456,15 +651,14 @@ window.removeFilter = index => {
 function renderSorts() {
   if (!state.meta || !$('#sortRows')) return;
   const rows = state.sorts.length ? state.sorts : [];
-  $('#sortRows').innerHTML = rows.map((sort, index) => `<div class="sort-row" data-index="${index}"><select>${filterFields().map(h => `<option value="${esc(h)}"${h === sort.field ? ' selected' : ''}>${esc(h)}</option>`).join('')}</select><select><option value="asc"${sort.direction !== 'desc' ? ' selected' : ''}>升序</option><option value="desc"${sort.direction === 'desc' ? ' selected' : ''}>降序</option></select><button class="mini delete" type="button" onclick="removeSort(${index})">删除</button></div>`).join('');
+  $('#sortRows').innerHTML = rows.map((sort, index) => `<div class="sort-row" data-index="${index}">${fieldComboHtml(sort.field, filterFields())}<select data-direction><option value="asc"${sort.direction !== 'desc' ? ' selected' : ''}>升序</option><option value="desc"${sort.direction === 'desc' ? ' selected' : ''}>降序</option></select><button class="mini delete" type="button" onclick="removeSort(${index})">删除</button></div>`).join('');
 }
 
 function collectSorts() {
   return $$('#sortRows .sort-row').map(row => {
-    const selects = row.querySelectorAll('select');
     return {
-      field: selects[0]?.value || '',
-      direction: selects[1]?.value || 'asc',
+      field: comboValue(row.querySelector('[data-combo]')),
+      direction: row.querySelector('[data-direction]')?.value || 'asc',
     };
   }).filter(item => item.field);
 }
@@ -630,11 +824,13 @@ function renderServerForm(row) {
     if (h === '负责人') {
       return `<label>${esc(h)}<span class="owner-field"><input name="负责人" value="${esc(row['负责人'] || '')}"><button class="mini sync-owner" type="button" id="syncOwnerBtn" title="按当前客户从客户表同步负责人">自动同步负责人</button></span></label>`;
     }
-    return `<label>${esc(h)}${state.meta.key.includes(h) ? ' *' : ''}<input name="${esc(h)}" value="${esc(row[h] || '')}"${readonly}></label>`;
+    const required = state.meta.key.includes(h) ? ' *' : '';
+    return `<label${fieldLabelClass(h)}>${esc(h)}${required}${textFieldInput(h, row[h] || '', readonly)}</label>`;
   }).join('') + `<div class="server-location">
     <label>所在机房 *<select id="serverRoomSelect" name="所在机房"></select></label>
     <label>所属机柜 *<select id="serverCabinetSelect" name="所属机柜"></select></label>
     <label class="slot-value">所属机位 *<input id="serverSlotInput" name="所属机位" value="${esc(row['所属机位'] || '')}" readonly></label>
+    <div id="swapNotice" class="swap-notice" hidden></div>
     <div class="slot-picker" id="serverSlotPicker"></div>
   </div>`;
   const roomSelect = $('#serverRoomSelect');
@@ -654,25 +850,76 @@ function renderServerForm(row) {
     const end = state.slotPick.end ?? state.slotPick.start;
     const selectedLow = start && end ? Math.min(start, end) : null;
     const selectedHigh = start && end ? Math.max(start, end) : null;
+    const swapRange = state.swapTarget && state.swapTarget.room === roomSelect.value && state.swapTarget.cabinet === cabinetSelect.value
+      ? String(state.swapTarget.slots || state.swapTarget.slot) : null;
+    const swapSlots = swapRange ? new Set(slotNumbers(swapRange).map(String)) : null;
     $('#serverSlotPicker').innerHTML = cabinet ? cabinet.slots.map(slot => {
       const num = Number(slot.slot);
       const selectedClass = selectedLow !== null && num >= selectedLow && num <= selectedHigh ? ' selected' : '';
-      const locked = isSlotSelectable(slot) ? '' : ' disabled';
+      const swapClass = swapSlots && swapSlots.has(String(slot.slot)) ? ' swap-target' : '';
+      const usable = isSlotSelectable(slot);
+      const locked = usable ? '' : (canSwapSlots() ? ' disabled swapable' : ' disabled');
       const info = slotInfoText(slot);
-      return `<button class="slot-choice${selectedClass}${locked}" type="button" data-slot="${esc(slot.slot)}" data-slot-info="${esc(info)}" aria-disabled="${locked ? 'true' : 'false'}"><b>${esc(slot.slot)}</b><span>${esc(slotStatusText(slot))}</span></button>`;
+      const text = swapClass ? `交换→${slotStatusText(slot)}` : slotStatusText(slot);
+      return `<button class="slot-choice${selectedClass}${swapClass}${locked}" type="button" data-slot="${esc(slot.slot)}" data-slot-info="${esc(info)}" data-slot-status="${esc(slot.status || 'free')}" data-slot-owner="${esc(slot.server || '')}" data-slot-range="${esc(slot.owner_range || '')}" aria-disabled="${usable ? 'false' : 'true'}"><b>${esc(slot.slot)}</b><span>${esc(text)}</span></button>`;
     }).join('') : '<div class="empty">请先维护机柜信息</div>';
     $$('#serverSlotPicker .slot-choice').forEach(btn => {
       if (btn.classList.contains('disabled')) {
         bindSlotInfoTooltip(btn, btn.dataset.slotInfo);
+        if (canSwapSlots()) btn.onclick = () => requestSlotSwap(btn.dataset.slot);
         return;
       }
       btn.onclick = () => chooseSlot(Number(btn.dataset.slot));
     });
+    renderSwapNotice();
+  }
+  function canSwapSlots() {
+    return state.entity === 'servers' && !!state.editing;
+  }
+  function swapRangeText(range, fallbackSlot) {
+    const nums = slotNumbers(range);
+    if (!nums.length) return `第 ${fallbackSlot} 行`;
+    const low = Math.min(...nums), high = Math.max(...nums);
+    return nums.length > 1 ? `第 ${low}-${high} 行（共 ${nums.length} 行）` : `第 ${fallbackSlot} 行`;
+  }
+  function requestSlotSwap(slotValue) {
+    const room = rooms.find(x => x.name === roomSelect.value);
+    const cabinet = room?.cabinets.find(x => x.name === cabinetSelect.value);
+    const slot = cabinet?.slots.find(x => String(x.slot) === String(slotValue));
+    if (!room || !cabinet || !slot) return;
+    const owner = slot.server || '其他记录';
+    const statusLabel = slot.status === 'occupied' ? '已占用' : slotStatusText(slot);
+    // 对方可能占用多行：以占用者的完整机位范围 owner_range 为准，交换时整段对调
+    const range = slot.owner_range || slotRangeValue(Number(slot.slot), Number(slot.slot));
+    if (!confirm(`机位 ${swapRangeText(range, slot.slot)} 已被 ${owner} 占用（${statusLabel}）。\n是否与它交换位置？交换后两台服务器的机位范围将整体对调。`)) return;
+    state.swapTarget = { room: room.name, cabinet: cabinet.name, slot: String(slot.slot), slots: range, owner, status: slot.status };
+    state.slotPick = { start: null, end: null };
+    $('#serverSlotInput').value = range;
+    renderSlotPicker();
+  }
+  function renderSwapNotice() {
+    const el = $('#swapNotice');
+    if (!el) return;
+    if (!state.swapTarget) {
+      el.hidden = true;
+      el.innerHTML = '';
+      return;
+    }
+    const t = state.swapTarget;
+    el.hidden = false;
+    el.innerHTML = `<span>⇄ 将与 <b>${esc(t.owner || '其他记录')}</b> 交换位置：${esc(t.room)} / ${esc(t.cabinet)} / ${esc(swapRangeText(t.slots || t.slot, t.slot))}</span><button type="button" class="mini" id="cancelSwapBtn">取消交换</button>`;
+    const btn = $('#cancelSwapBtn');
+    if (btn) btn.onclick = () => {
+      state.swapTarget = null;
+      $('#serverSlotInput').value = '';
+      renderSlotPicker();
+    };
   }
   function chooseSlot(slot) {
     const room = rooms.find(x => x.name === roomSelect.value);
     const cabinet = room?.cabinets.find(x => x.name === cabinetSelect.value);
     if (!cabinet) return;
+    state.swapTarget = null;
     if (!state.slotPick.start || state.slotPick.end) {
       state.slotPick = { start: slot, end: null };
       $('#serverSlotInput').value = slotRangeValue(slot, slot);
@@ -695,11 +942,13 @@ function renderServerForm(row) {
   }
   roomSelect.onchange = () => {
     state.slotPick = { start: null, end: null };
+    state.swapTarget = null;
     $('#serverSlotInput').value = '';
     renderCabinetSelect();
   };
   cabinetSelect.onchange = () => {
     state.slotPick = { start: null, end: null };
+    state.swapTarget = null;
     $('#serverSlotInput').value = '';
     renderSlotPicker();
   };
@@ -710,6 +959,7 @@ function renderServerForm(row) {
 async function openModal(mode, row = {}) {
   if (mode !== 'pending') state.pendingEditing = null;
   state.editing = mode === 'edit' ? row : null;
+  state.swapTarget = null;
   const titles = { edit: '修改', add: '新增', pending: '编辑待审批' };
   $('#modalTitle').textContent = (titles[mode] || '新增') + state.meta.label;
   $('#modalEyebrow').textContent = mode === 'pending' ? 'PENDING CHANGE' : mode === 'edit' ? 'EDIT RECORD' : 'NEW RECORD';
@@ -725,7 +975,8 @@ async function openModal(mode, row = {}) {
   } else {
     $('#formFields').innerHTML = state.meta.headers.map(h => {
       const readonly = isKeyReadonlyInForm(h) ? ' readonly' : '';
-      return `<label>${esc(h)}${state.meta.key.includes(h) ? ' *' : ''}<input name="${esc(h)}" value="${esc(row[h] || '')}"${readonly}></label>`;
+      const required = state.meta.key.includes(h) ? ' *' : '';
+      return `<label${fieldLabelClass(h)}>${esc(h)}${required}${textFieldInput(h, row[h] || '', readonly)}</label>`;
     }).join('');
   }
   $('#modal').classList.add('open');
@@ -737,6 +988,7 @@ $('#addBtn').onclick = () => openModal('add');
 function closeModal() {
   $('#modal').classList.remove('open');
   state.pendingEditing = null;
+  state.swapTarget = null;
 }
 
 $('#closeModal').onclick = closeModal;
@@ -746,6 +998,19 @@ $('#recordForm').onsubmit = async e => {
   e.preventDefault();
   const row = Object.fromEntries(new FormData(e.target));
   try {
+    if (state.entity === 'servers' && state.swapTarget && state.editing) {
+      const body = {
+        old: state.editing,
+        new: row,
+        target: { room: state.swapTarget.room, cabinet: state.swapTarget.cabinet, slot: state.swapTarget.slot, slots: state.swapTarget.slots },
+      };
+      const d = await api('/api/servers/swap-slot', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+      toast(d.message);
+      closeModal();
+      await loadEntity();
+      if (APP_ROLE === 'admin') refreshBadge();
+      return;
+    }
     const pending = state.pendingEditing;
     const url = pending ? `/api/changes/${pending._pending_change_id}/update-pending` : state.editing ? `/api/${state.entity}/update` : `/api/${state.entity}/add`;
     const body = pending ? { new_data: row } : state.editing ? { old: state.editing, new: row } : row;
@@ -761,7 +1026,8 @@ $('#recordForm').onsubmit = async e => {
 
 window.removeRow = async s => {
   const row = JSON.parse(decodeURIComponent(s));
-  if (!confirm('确定提交删除申请？审核通过后才会从正式 Excel 删除。')) return;
+  const tip = APP_ROLE === 'admin' ? '确定删除该记录？将直接生效。' : '确定提交删除申请？审核通过后才会从正式 Excel 删除。';
+  if (!confirm(tip)) return;
   try {
     const d = await api(`/api/${state.entity}/delete`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(row) });
     toast(d.message);
@@ -775,7 +1041,8 @@ window.removeRow = async s => {
 $('#bulkDeleteBtn').onclick = async () => {
   const rows = selectedRows();
   if (!rows.length) return;
-  if (!confirm(`确定提交 ${rows.length} 条删除申请？审核通过后才会从正式 Excel 删除。`)) return;
+  const tip = APP_ROLE === 'admin' ? `确定删除 ${rows.length} 条记录？将直接生效。` : `确定提交 ${rows.length} 条删除申请？审核通过后才会从正式 Excel 删除。`;
+  if (!confirm(tip)) return;
   try {
     const d = await api(`/api/${state.entity}/delete-batch`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ records: rows }) });
     toast(d.message);
@@ -796,6 +1063,7 @@ $('#importInput').onchange = async e => {
   try {
     const d = await api(`/api/${state.entity}/import`, { method: 'POST', body: fd });
     toast(d.message);
+    await loadEntity();
     if (APP_ROLE === 'admin') refreshBadge();
   } catch (err) {
     if (err.data && Array.isArray(err.data.details) && err.data.details.length) {
@@ -818,13 +1086,13 @@ function renderReviewFilters() {
   const container = $('#reviewFilterRows');
   if (!container) return;
   const rows = state.reviewFilters.length ? state.reviewFilters : [{ field: RACK_REVIEW_FILTER_FIELDS[0], pattern: '' }];
-  container.innerHTML = rows.map((filter, index) => `<div class="filter-row review-filter-row" data-index="${index}"><select>${RACK_REVIEW_FILTER_FIELDS.map(field => `<option value="${esc(field)}"${field === filter.field ? ' selected' : ''}>${esc(field)}</option>`).join('')}</select><input value="${esc(filter.pattern || '')}" placeholder="输入筛选内容"><button class="mini delete" type="button" onclick="removeReviewFilter(${index})">删除</button></div>`).join('');
+  container.innerHTML = rows.map((filter, index) => `<div class="filter-row review-filter-row" data-index="${index}">${fieldComboHtml(filter.field, RACK_REVIEW_FILTER_FIELDS)}<input data-pattern value="${esc(filter.pattern || '')}" placeholder="输入筛选内容"><button class="mini delete" type="button" onclick="removeReviewFilter(${index})">删除</button></div>`).join('');
 }
 
 function collectReviewFilters() {
   return $$('#reviewFilterRows .review-filter-row').map(row => {
-    const field = row.querySelector('select')?.value || '';
-    const pattern = row.querySelector('input')?.value.trim() || '';
+    const field = comboValue(row.querySelector('[data-combo]'));
+    const pattern = row.querySelector('[data-pattern]')?.value.trim() || '';
     return { field, pattern };
   }).filter(item => item.field && item.pattern);
 }
@@ -937,7 +1205,7 @@ function rackApprovalFormById(id) {
 
 function collectRackApprovalData(id) {
   const form = rackApprovalFormById(id);
-  return form ? Object.fromEntries([...form.querySelectorAll('input,select')].map(input => [input.name, input.value.trim()])) : {};
+  return form ? Object.fromEntries([...form.querySelectorAll('input,select,textarea')].map(input => [input.name, input.value.trim()])) : {};
 }
 
 function hydrateRackApprovalForms() {
@@ -1051,13 +1319,13 @@ function reviewEditor(c) {
   if (c.status !== 'pending') return pretty(c.new_data);
   return `<div class="review-edit" data-change-id="${esc(c.id)}">${c.meta.headers.map(h => {
     const readonly = c.entity !== 'customers' && c.meta.key.includes(h) ? ' readonly' : '';
-    return `<label>${esc(h)}${readonly ? ' *' : ''}<input name="${esc(h)}" value="${esc((c.new_data || {})[h] || '')}"${readonly}></label>`;
+    return `<label${fieldLabelClass(h)}>${esc(h)}${readonly ? ' *' : ''}${textFieldInput(h, (c.new_data || {})[h] || '', readonly)}</label>`;
   }).join('')}</div>`;
 }
 
 function collectReviewData(id) {
   const form = document.querySelector(`.review-edit[data-change-id="${id}"]`);
-  return form ? Object.fromEntries([...form.querySelectorAll('input')].map(input => [input.name, input.value])) : undefined;
+  return form ? Object.fromEntries([...form.querySelectorAll('input,textarea')].map(input => [input.name, input.value])) : undefined;
 }
 
 function selectedChangeIds() {
@@ -1089,7 +1357,28 @@ function updateChangeSelection() {
   });
 }
 
+function swapChangeCard(c) {
+  const payload = c.new_data || {};
+  const selfNew = payload.self || {};
+  const selfFrom = payload.self_from || {};
+  const target = payload.target || {};
+  const targetFrom = target.from || {};
+  const kindLabel = { official: '已实施', pending_change: '待审核', rack_request: '待实施' }[target.kind] || (target.kind || '');
+  const actions = c.status === 'pending'
+    ? `<div class="review-actions"><button class="btn danger" onclick="review('${c.id}','reject')">驳回</button><button class="btn primary" onclick="review('${c.id}','approve')">通过交换</button></div>`
+    : '';
+  const selector = c.status === 'pending' ? `<label class="change-picker"><input class="change-select" type="checkbox" data-id="${esc(c.id)}"> 选择</label>` : '';
+  const slotText = (loc, slot) => `${esc(loc.room || '')} / ${esc(loc.cabinet || '')} / 第 ${esc(slot || '')} 行`;
+  return `<article class="review-card swap-card">${selector}<div class="review-top"><span class="tag swap">交换机位</span><strong>${esc(c.entity_label)} · ${esc(c.record_key)}</strong><span class="review-time">${esc(c.submitter)} · ${esc(c.submitted_at)}</span></div>
+    <div class="swap-grid">
+      <div class="swap-side"><b>${esc(c.record_key)}</b><div class="muted">原位置</div><div>${slotText(selfFrom, selfFrom.slot)}</div><div class="swap-arrow">↓ 迁往</div><div>${slotText(selfNew, selfNew['所属机位'])}</div></div>
+      <div class="swap-side"><b>${esc(target.key || '—')} <span class="muted">（${esc(kindLabel)}）</span></b><div class="muted">原位置</div><div>${slotText(targetFrom, targetFrom.slot)}</div><div class="swap-arrow">↓ 迁往</div><div>${slotText(selfFrom, selfFrom.slot)}</div></div>
+    </div>
+    ${c.reject_reason ? `<p class="muted">驳回原因：${esc(c.reject_reason)}</p>` : ''}${actions}</article>`;
+}
+
 function changeCard(c) {
+  if (c.operation === '交换机位') return swapChangeCard(c);
   const actions = c.status === 'pending' ? `<div class="review-actions"><button class="btn danger" onclick="review('${c.id}','reject')">驳回</button><button class="btn primary" onclick="review('${c.id}','approve')">通过并合并</button></div>` : '';
   const selector = c.status === 'pending' ? `<label class="change-picker"><input class="change-select" type="checkbox" data-id="${esc(c.id)}"> 选择</label>` : '';
   return `<article class="review-card">${selector}<div class="review-top"><span class="tag ${c.operation === '删除' ? 'delete' : ''}">${esc(c.operation)}</span><strong>${esc(c.entity_label)} · ${esc(c.record_key)}</strong><span class="review-time">${esc(c.submitter)} · ${esc(c.submitted_at)}</span></div><div class="diff"><div class="diff-box"><b>当前正式数据</b>${pretty(c.current_data)}</div><div class="diff-arrow">→</div><div class="diff-box"><b>审批后数据</b>${reviewEditor(c)}</div></div>${c.reject_reason ? `<p class="muted">驳回原因：${esc(c.reject_reason)}</p>` : ''}${actions}</article>`;
@@ -1130,7 +1419,7 @@ function rackApprovalForm(item) {
     if (field === '客户id' || field === '客户名称') {
       return `<label>${esc(field)}${customerInput(field, draft[field] || '', readonly)}</label>`;
     }
-    return `<label>${esc(field)}<input name="${esc(field)}" value="${esc(draft[field] || '')}"${readonly}></label>`;
+    return `<label${fieldLabelClass(field)}>${esc(field)}${textFieldInput(field, draft[field] || '', readonly)}</label>`;
   }).join('');
   const approveText = state.reviewMode === 'allocation' ? '完成服务器机位IP分配' : '完成具体实施';
   const autoIpButton = state.reviewMode === 'allocation' ? '<button class="btn ghost" type="button" data-rack-auto-ip>自动分配 IP</button>' : '';
@@ -1204,13 +1493,13 @@ function renderRackRequestFilters() {
   const container = $('#rackRequestFilterRows');
   if (!container) return;
   const rows = state.rackRequestFilters.length ? state.rackRequestFilters : [{ field: RACK_REVIEW_FILTER_FIELDS[0], pattern: '' }];
-  container.innerHTML = rows.map((filter, index) => `<div class="filter-row rack-request-filter-row" data-index="${index}"><select>${RACK_REVIEW_FILTER_FIELDS.map(field => `<option value="${esc(field)}"${field === filter.field ? ' selected' : ''}>${esc(field)}</option>`).join('')}</select><input value="${esc(filter.pattern || '')}" placeholder="输入筛选内容"><button class="mini delete" type="button" onclick="removeRackRequestFilter(${index})">删除</button></div>`).join('');
+  container.innerHTML = rows.map((filter, index) => `<div class="filter-row rack-request-filter-row" data-index="${index}">${fieldComboHtml(filter.field, RACK_REVIEW_FILTER_FIELDS)}<input data-pattern value="${esc(filter.pattern || '')}" placeholder="输入筛选内容"><button class="mini delete" type="button" onclick="removeRackRequestFilter(${index})">删除</button></div>`).join('');
 }
 
 function collectRackRequestFilters() {
   return $$('#rackRequestFilterRows .rack-request-filter-row').map(row => {
-    const field = row.querySelector('select')?.value || '';
-    const pattern = row.querySelector('input')?.value.trim() || '';
+    const field = comboValue(row.querySelector('[data-combo]'));
+    const pattern = row.querySelector('[data-pattern]')?.value.trim() || '';
     return { field, pattern };
   }).filter(item => item.field && item.pattern);
 }
@@ -1600,8 +1889,46 @@ async function toggleTokenPop() {
     body.innerHTML = '<p class="token-tip">暂无token,联系管理员获取</p>';
   }
 }
-if ($('#tokenBtn')) $('#tokenBtn').onclick = toggleTokenPop;
+
+function toggleKeyMenu() {
+  const menu = $('#keyMenu');
+  if (!menu) return;
+  menu.hidden = !menu.hidden;
+}
+
+function closeKeyMenu() {
+  const menu = $('#keyMenu');
+  if (menu && !menu.hidden) menu.hidden = true;
+}
+
+if ($('#tokenBtn')) $('#tokenBtn').onclick = e => { e.stopPropagation(); toggleKeyMenu(); };
+if ($('#keyMenuToken')) $('#keyMenuToken').onclick = () => { closeKeyMenu(); toggleTokenPop(); };
+if ($('#keyMenuSkill')) $('#keyMenuSkill').onclick = () => { closeKeyMenu(); downloadSkill(); };
 if ($('#tokenClose')) $('#tokenClose').onclick = () => { const p = $('#tokenPop'); if (p) p.hidden = true; };
+document.addEventListener('click', () => closeKeyMenu());
+
+async function downloadSkill() {
+  try {
+    const r = await fetch('/api/skill/download');
+    if (!r.ok) {
+      let msg = '下载失败';
+      try { const d = await r.json(); msg = d.error || msg; } catch (e) {}
+      toast(msg, true);
+      return;
+    }
+    const blob = await r.blob();
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = 'server_management_skill.zip';
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+  } catch (e) {
+    toast('下载失败：' + (e.message || e), true);
+  }
+}
 
 async function refreshBadge() {
   if (APP_ROLE !== 'admin') return;
@@ -1611,27 +1938,268 @@ async function refreshBadge() {
 
 async function loadStats() {
   state.stats = await api('/api/statistics');
+  renderStatsFilterOptions();
   renderStats();
+}
+
+function statsMark(text, q) {
+  const safe = esc(text);
+  const keywords = (Array.isArray(q) ? q : [q])
+    .map(item => String(item ?? '').trim())
+    .filter(Boolean);
+  if (!keywords.length) return safe;
+  const needle = keywords.map(item => esc(item).replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('|');
+  return safe.replace(new RegExp(needle, 'ig'), m => `<mark>${m}</mark>`);
+}
+
+/* ==== 机柜统计：属性组合筛选（机房 / 机柜 / 序列号 / 客户名，条件之间为「与」） ==== */
+
+function statsFilterValues() {
+  return {
+    room: ($('#sfRoom')?.value || '').trim(),
+    cabinet: ($('#sfCabinet')?.value || '').trim(),
+    serial: ($('#sfSerial')?.value || '').trim(),
+    client: ($('#sfClient')?.value || '').trim(),
+  };
+}
+
+function statsFilterActive(f) {
+  return Boolean(f && (f.room || f.cabinet || f.serial || f.client));
+}
+
+function statsFilterKeywords(f) {
+  return [f.room, f.cabinet, f.serial, f.client].map(x => String(x || '').trim()).filter(Boolean);
+}
+
+function statsServerMatches(server, f) {
+  if (f.serial && !String(server['序列号'] || '').toLowerCase().includes(f.serial.toLowerCase())) return false;
+  if (f.client && !String(server['客户名称'] || '').toLowerCase().includes(f.client.toLowerCase())) return false;
+  return true;
+}
+
+function statsSlotMatches(slot, f) {
+  if (!f.serial && !f.client) return true;
+  if ((slot.servers || []).some(v => statsServerMatches(v, f))) return true;
+  return Boolean(f.serial && String(slot.pending_server || '').toLowerCase().includes(f.serial.toLowerCase()));
+}
+
+function statsSlotView(slot, f) {
+  if (!f.serial && !f.client) return slot;
+  return { ...slot, servers: (slot.servers || []).filter(v => statsServerMatches(v, f)) };
+}
+
+function statsRoomMatches(room, f) {
+  if (!f.room) return true;
+  return String(room.name || '未指定机房').toLowerCase().includes(f.room.toLowerCase());
+}
+
+function statsCabinetMatches(cabinet, f) {
+  if (f.cabinet && !String(cabinet.name || '').toLowerCase().includes(f.cabinet.toLowerCase())) return false;
+  return true;
+}
+
+function statsRoomsOf(stats) {
+  return (stats.rooms && stats.rooms.length) ? stats.rooms : groupCabinetsByRoom(stats.cabinets || []);
+}
+
+function renderStatsFilterOptions() {
+  const d = state.stats;
+  const roomInput = $('#sfRoom');
+  if (!d || !roomInput) return;
+  const rooms = statsRoomsOf(d);
+  const roomQuery = String(roomInput.value || '').trim().toLowerCase();
+  const visibleRooms = roomQuery
+    ? rooms.filter(r => String(r.name || '未指定机房').toLowerCase().includes(roomQuery))
+    : rooms;
+  // 机房 / 机柜均为可搜索输入框：候选由当前数据派生，机柜候选跟随机房输入收敛
+  $('#sfRoomList').innerHTML = rooms
+    .map(r => `<option value="${esc(r.name || '未指定机房')}">${esc(r.name || '未指定机房')}</option>`).join('');
+
+  const cabinetOptions = [];
+  visibleRooms.forEach(r => (r.cabinets || []).forEach(c => cabinetOptions.push({ name: c.name || '未分配机柜', room: r.name || '未指定机房' })));
+  $('#sfCabinetList').innerHTML = cabinetOptions
+    .map(x => `<option value="${esc(x.name)}">${esc(`${x.room} / ${x.name}`)}</option>`).join('');
+
+  const serials = new Set();
+  const clients = new Set();
+  rooms.forEach(r => (r.cabinets || []).forEach(c => (c.slots || []).forEach(slot => {
+    if (slot.pending_server) serials.add(slot.pending_server);
+    (slot.servers || []).forEach(v => {
+      if (v['序列号']) serials.add(v['序列号']);
+      if (v['客户名称']) clients.add(v['客户名称']);
+    });
+  })));
+  $('#sfSerialList').innerHTML = [...serials].sort().map(x => `<option value="${esc(x)}"></option>`).join('');
+  $('#sfClientList').innerHTML = [...clients].sort().map(x => `<option value="${esc(x)}"></option>`).join('');
+}
+
+function renderStatsFilterSummary(f, hits) {
+  const el = $('#sfSummary');
+  if (!el) return;
+  if (!statsFilterActive(f)) { el.textContent = ''; return; }
+  const labels = [
+    f.room ? `机房：${f.room}` : '',
+    f.cabinet ? `机柜：${f.cabinet}` : '',
+    f.serial ? `序列号：${f.serial}` : '',
+    f.client ? `客户名：${f.client}` : '',
+  ].filter(Boolean);
+  el.textContent = `筛选中 ${labels.join(' 与 ')} · 命中 ${hits} 台服务器`;
+}
+
+function groupCabinetsByRoom(cabinets) {
+  const rooms = [];
+  const index = {};
+  cabinets.forEach(cabinet => {
+    const name = cabinet.room || '未指定机房';
+    if (!index[name]) {
+      index[name] = { name, cabinet_count: 0, cabinets: [] };
+      rooms.push(index[name]);
+    }
+    index[name].cabinets.push(cabinet);
+    index[name].cabinet_count += 1;
+  });
+  rooms.sort((a, b) => String(a.name).localeCompare(String(b.name)));
+  return rooms;
+}
+
+function renderStatCabinet(cabinet, slots, q) {
+  const slotHtml = slots.map(slot => {
+    const status = slotStatusText(slot);
+    const pending = slot.pending_server
+      ? `<div class="server pending"><b>${statsMark(slot.pending_server, q)}</b><div>${esc(status)}</div></div>`
+      : '';
+    const servers = (slot.servers || []).map(v => `
+      <div class="server clickable" data-serial="${esc(v['序列号'])}" title="点击编辑该服务器">
+        <b>${statsMark(v['序列号'], q)} · ${esc(v['品牌'])} ${esc(v['型号'])}</b>
+        <div>占用机位：${esc(v['所属机位'])} · ${statsMark(v['管理ip'] || '无管理IP', q)}</div>
+        <div>客户：${statsMark(v['客户名称'], q)}</div>
+        <div>${esc(v['用途分类'])} · ${esc(v['用途'])}</div>
+      </div>`).join('');
+    const swapClass = slot.swap ? ' swap' : '';
+    const ref = slot.pending_request_id
+      ? ` data-request-id="${esc(slot.pending_request_id)}"`
+      : slot.pending_change_id ? ` data-change-id="${esc(slot.pending_change_id)}"` : '';
+    return `<div class="slot ${esc(slot.status || 'free')}${swapClass}" data-slot="${esc(slot.slot)}" data-status="${esc(slot.status || 'free')}"${ref} title="双击进入编辑 / 交换"><div class="slot-title"><b>第 ${statsMark(slot.slot, q)} 行</b><span>${esc(status)}</span></div>${servers}${pending}</div>`;
+  }).join('');
+  return `<article class="cabinet"><div class="cabinet-head"><b>${statsMark(cabinet.name || '未分配机柜', q)}</b><small>${statsMark(cabinet.room || '未指定机房', q)} · ${esc(cabinet.rack_range || (cabinet.slots || []).length + ' 行')}</small></div><div class="slots">${slotHtml}</div></article>`;
 }
 
 function renderStats() {
   const d = state.stats;
-  $('#statCards').innerHTML = [['机柜数量', d.summary.cabinet_count], ['服务器数量', d.summary.server_count], ['客户数量', d.summary.client_count]].map(x => `<div class="stat-card"><small>${x[0]}</small><b>${x[1]}</b></div>`).join('');
-  const q = $('#statsSearch').value.trim().toLowerCase();
-  const cabinets = d.cabinets.filter(c => JSON.stringify(c).toLowerCase().includes(q));
-  $('#cabinetGrid').innerHTML = cabinets.length ? cabinets.map(c => {
-    const slots = c.slots.map(s => {
-      const status = slotStatusText(s);
-      const pending = s.pending_server ? `<div class="server"><b>${esc(s.pending_server)}</b><div>${esc(status)}</div></div>` : '';
-      const servers = s.servers.map(v => `<div class="server"><b>${esc(v['序列号'])} · ${esc(v['品牌'])} ${esc(v['型号'])}</b><div>占用机位：${esc(v['所属机位'])} · ${esc(v['管理ip'] || '无管理IP')}</div><div>客户：${esc(v['客户名称'])}</div><div>${esc(v['用途分类'])} · ${esc(v['用途'])}</div></div>`).join('');
-      return `<div class="slot ${esc(s.status || 'free')}"><div class="slot-title"><b>第 ${esc(s.slot)} 行</b><span>${esc(status)}</span></div>${servers}${pending}</div>`;
-    }).join('');
-    return `<article class="cabinet"><div class="cabinet-head"><b>${esc(c.name || '未分配机柜')}</b><small>${esc(c.room || '未指定机房')} · ${esc(c.rack_range || c.slots.length + ' 行')}</small></div><div class="slots">${slots}</div></article>`;
-  }).join('') : '<div class="card empty">没有匹配的机柜</div>';
+  if (!d) return;
+  $('#statCards').innerHTML = [['机柜数量', d.summary.cabinet_count], ['服务器数量', d.summary.server_count], ['客户数量', d.summary.client_count]]
+    .map(x => `<div class="stat-card"><small>${x[0]}</small><b>${x[1]}</b></div>`).join('');
+  const f = statsFilterValues();
+  const active = statsFilterActive(f);
+  const keywords = statsFilterKeywords(f);
+  const rooms = statsRoomsOf(d);
+  let hits = 0;
+  const html = rooms.map(room => {
+    if (!statsRoomMatches(room, f)) return '';
+    const cards = [];
+    (room.cabinets || []).forEach(cabinet => {
+      if (!statsCabinetMatches(cabinet, f)) return;
+      const slots = (cabinet.slots || [])
+        .filter(slot => statsSlotMatches(slot, f))
+        .map(slot => statsSlotView(slot, f));
+      if (!slots.length) return;
+      slots.forEach(slot => { hits += (slot.servers || []).length; });
+      cards.push(renderStatCabinet(cabinet, slots, keywords));
+    });
+    if (!cards.length) return '';
+    const total = room.slot_total ?? (room.cabinets || []).reduce((sum, c) => sum + (c.slots || []).length, 0);
+    const occupied = room.slot_occupied ?? (room.cabinets || []).reduce((sum, c) => sum + (c.slots || []).filter(s => s.status && s.status !== 'free').length, 0);
+    return `<section class="room-block"><div class="room-head"><h3>${statsMark(room.name || '未指定机房', keywords)}</h3><span>${room.cabinet_count ?? cards.length} 个机柜 · 占用 ${occupied}/${total} 机位</span></div><div class="cabinet-grid">${cards.join('')}</div></section>`;
+  }).join('');
+  $('#cabinetGrid').innerHTML = html || `<div class="card empty">${active ? '没有符合筛选条件的机位' : '暂无机柜数据'}</div>`;
+  renderStatsFilterSummary(f, hits);
+  bindStatsInteractions();
 }
 
-const ss = $('#statsSearch');
-if (ss) ss.oninput = () => state.stats && renderStats();
+let statsNavLock = false;
+
+async function navigateToServerEdit(serial) {
+  if (statsNavLock || !serial) return;
+  statsNavLock = true;
+  try {
+    const navBtn = document.querySelector('.nav-item[data-page="maintenance"]');
+    if (navBtn) openPage(navBtn);
+    $$('.entity-tab').forEach(x => x.classList.toggle('active', x.dataset.entity === 'servers'));
+    state.entity = 'servers';
+    await loadEntity();
+    const row = state.records.find(r => r['序列号'] === serial);
+    if (!row) {
+      toast('未找到该服务器记录，可能已被删除', true);
+      return;
+    }
+    await openModal('edit', row);
+  } catch (e) {
+    toast(e.message, true);
+  } finally {
+    statsNavLock = false;
+  }
+}
+
+function gotoReviewMode(mode) {
+  const btn = document.querySelector(`.nav-sub-item[data-nav-review-mode="${mode}"]`);
+  if (btn) openPage(btn);
+}
+
+function handleStatsSlotDblClick(el) {
+  const serverEl = el.querySelector('.server.clickable');
+  if (serverEl) {
+    navigateToServerEdit(serverEl.dataset.serial);
+    return;
+  }
+  const status = el.dataset.status || 'free';
+  if (status === 'pending_implementation') {
+    toast('该机位由待实施的上架请求占用，已跳转到具体实施');
+    gotoReviewMode('implementation');
+    return;
+  }
+  if (status === 'pending_occupied' || status === 'pending_release') {
+    toast('该机位存在待审核变更，已跳转到操作审核');
+    gotoReviewMode('operations');
+    return;
+  }
+  toast('该机位当前空闲');
+}
+
+function bindStatsInteractions() {
+  $$('#cabinetGrid .server.clickable').forEach(el => {
+    el.onclick = event => {
+      event.stopPropagation();
+      navigateToServerEdit(el.dataset.serial);
+    };
+  });
+  $$('#cabinetGrid .slot').forEach(el => {
+    el.ondblclick = () => handleStatsSlotDblClick(el);
+  });
+}
+
+function bindStatsFilters() {
+  const roomInput = $('#sfRoom');
+  if (!roomInput) return;
+  // 机房输入变化 → 机柜候选随机房收敛，并即时筛选
+  const applyRoom = () => { renderStatsFilterOptions(); if (state.stats) renderStats(); };
+  roomInput.oninput = applyRoom;
+  roomInput.onchange = applyRoom;
+  ['#sfCabinet', '#sfSerial', '#sfClient'].forEach(selector => {
+    const el = $(selector);
+    if (el) el.oninput = () => state.stats && renderStats();
+  });
+  $('#sfReset').onclick = () => {
+    ['#sfRoom', '#sfCabinet', '#sfSerial', '#sfClient'].forEach(selector => {
+      const el = $(selector);
+      if (el) el.value = '';
+    });
+    renderStatsFilterOptions();
+    if (state.stats) renderStats();
+  };
+}
+
+bindStatsFilters();
+bindFieldCombos();
 if ($('#rackRequestForm')) {
   const form = $('#rackRequestForm');
   loadCustomerOptions().then(() => bindCustomerInputs(form)).catch(e => toast(e.message, true));

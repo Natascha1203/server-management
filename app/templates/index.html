@@ -20,7 +20,7 @@
       <button class="nav-item" data-page="rackRequests" data-capability="submit_rack_request"><span>⇅</span> 上下架请求</button>
       <button class="nav-item" data-page="settings" data-capability="manage_settings"><span>⚙</span> 设置</button>
     </nav>
-    <div class="account"><div class="avatar">{{ username[0]|upper }}</div><div><b>{{ username }}</b><small>{{ role_name }}</small></div><button id="tokenBtn" type="button" title="获取 API Token">🔑</button><form method="post" action="/logout"><button title="退出">↪</button></form></div>
+    <div class="account"><div class="avatar">{{ username[0]|upper }}</div><div><b>{{ username }}</b><small>{{ role_name }}</small></div><div class="key-menu-wrap"><button id="tokenBtn" type="button" title="账号工具">🔑</button><div id="keyMenu" class="key-menu" hidden><button id="keyMenuToken" type="button">🔑 获取 Token</button><button id="keyMenuSkill" type="button">⬇ 下载 Skill</button></div></div><form method="post" action="/logout"><button title="退出">↪</button></form></div>
     <div id="tokenPop" class="token-pop" hidden>
       <div class="token-pop-head"><span>API Token</span><button id="tokenClose" type="button" title="关闭">×</button></div>
       <div id="tokenBody"></div>
@@ -100,7 +100,15 @@
     </section>
 
     <section id="statistics" class="page">
-      <div class="hero stats-hero"><div><h2>机柜资源视图</h2><p>按机房和机柜查看机位占用、服务器信息及客户归属。</p></div><div class="search-wrap light"><span>⌕</span><input id="statsSearch" placeholder="筛选机柜、IP、客户..."></div></div>
+      <div class="hero stats-hero"><div><h2>机柜资源视图</h2><p>按机房分组查看机位占用；点击服务器进入编辑，双击机位可进入编辑或交换。</p></div><div class="hero-note"><b>组合筛选</b><span>机房 / 机柜 / 序列号 / 客户名，多个条件为「与」关系</span></div></div>
+      <div class="stats-filter card">
+        <label class="sf-field"><span>机房</span><input id="sfRoom" list="sfRoomList" placeholder="输入或选择机房" autocomplete="off"><datalist id="sfRoomList"></datalist></label>
+        <label class="sf-field"><span>机柜</span><input id="sfCabinet" list="sfCabinetList" placeholder="输入或选择机柜" autocomplete="off"><datalist id="sfCabinetList"></datalist></label>
+        <label class="sf-field"><span>序列号</span><input id="sfSerial" list="sfSerialList" placeholder="输入或选择序列号" autocomplete="off"><datalist id="sfSerialList"></datalist></label>
+        <label class="sf-field"><span>客户名</span><input id="sfClient" list="sfClientList" placeholder="输入或选择客户名" autocomplete="off"><datalist id="sfClientList"></datalist></label>
+        <button id="sfReset" class="btn ghost" type="button">重置</button>
+        <span id="sfSummary" class="sf-summary"></span>
+      </div>
       <div id="statCards" class="stat-cards"></div>
       <div id="cabinetGrid" class="cabinet-grid"></div>
     </section>

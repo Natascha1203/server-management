@@ -112,6 +112,13 @@ def load_config(config_path=None):
 
     notify_webhook_url = parser.get("app", "notify_webhook_url", fallback="").strip() or os.environ.get("SM_NOTIFY_WEBHOOK_URL", "")
 
+    skill_zip_text = parser.get("app", "skill_zip_path", fallback="").strip() or os.environ.get("SM_SKILL_ZIP_PATH", "")
+    skill_zip_path = None
+    if skill_zip_text:
+        skill_zip_path = Path(skill_zip_text)
+        if not skill_zip_path.is_absolute():
+            skill_zip_path = base_dir / skill_zip_path
+
     return {
         "base_dir": base_dir,
         "data_dir": data_dir,
@@ -124,5 +131,6 @@ def load_config(config_path=None):
         "notify_enabled": 1 if parser.getboolean("app", "notify_enabled", fallback=False) else 0,
         "notify_webhook_url": notify_webhook_url,
         "notify_message_type": parser.get("app", "notify_message_type", fallback="markdown").strip() or "markdown",
+        "skill_zip_path": skill_zip_path,
         "users": users,
     }

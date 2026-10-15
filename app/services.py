@@ -145,11 +145,28 @@ def occupied_slots(exclude_record_key=None):
     return result
 
 
+def occupied_slot_ranges(exclude_record_key=None):
+    """每个已实施服务器占用的机位 -> 该服务器占用的完整机位范围。
+
+    交换时机位需整段对调（对方可能占用多行），因此前端要能拿到「占用者的完整范围」。
+    """
+    server_meta = ENTITIES["servers"]
+    result = {}
+    for server in read_records("servers"):
+        if exclude_record_key and record_key(server_meta, server) == exclude_record_key:
+            continue
+        key = (server["所在机房"], server["所属机柜"])
+        range_value = clean_value(server["所属机位"])
+        for slot in positions(range_value):
+            result.setdefault(key, {})[slot] = range_value
+    return result
+
+
 def pending_server_slot_states():
     result = {}
     with db() as conn:
         rows = conn.execute(
-            "SELECT operation,record_key,new_data FROM changes WHERE status='pending' AND entity='servers'"
+            "SELECT id,operation,record_key,new_data FROM changes WHERE status='pending' AND entity='servers'"
         ).fetchall()
     for change in rows:
         if change["operation"] == "新增" and change["new_data"]:
@@ -160,6 +177,8 @@ def pending_server_slot_states():
                     "status": "pending_occupied",
                     "server": server["序列号"] or change["record_key"],
                     "selectable": False,
+                    "change_id": change["id"],
+                    "slot_range": clean_value(server["所属机位"]),
                 }
         if change["operation"] == "删除":
             server = find_record("servers", change["record_key"])
@@ -171,6 +190,29 @@ def pending_server_slot_states():
                     "status": "pending_release",
                     "server": server["序列号"],
                     "selectable": True,
+                    "slot_range": clean_value(server["所属机位"]),
+                }
+        if change["operation"] == SWAP_OPERATION and change["new_data"]:
+            data = parse_json_dict(change["new_data"])
+            self_new = normalize_row("servers", data.get("self") or {})
+            self_from = data.get("self_from") or {}
+            # 我方：即将迁入对方机位 => 目标机位待审核占用
+            for slot in positions(self_new.get("所属机位")):
+                result.setdefault((self_new["所在机房"], self_new["所属机柜"]), {})[slot] = {
+                    "status": "pending_occupied",
+                    "server": self_new["序列号"] or change["record_key"],
+                    "selectable": False,
+                    "swap": True,
+                    "slot_range": clean_value(self_new.get("所属机位")),
+                }
+            # 我方原机位在新数据里已不再包含，标记为待审核释放（交换中）
+            for slot in positions(self_from.get("slot")):
+                result.setdefault((clean_value(self_from.get("room")), clean_value(self_from.get("cabinet"))), {})[slot] = {
+                    "status": "pending_release",
+                    "server": self_new["序列号"] or change["record_key"],
+                    "selectable": False,
+                    "swap": True,
+                    "slot_range": clean_value(self_from.get("slot")),
                 }
     return result
 
@@ -201,6 +243,7 @@ def implementation_slot_states(exclude_request_id=""):
                 "server": row["serial_number"],
                 "selectable": False,
                 "request_id": row["id"],
+                "slot_range": clean_value(data.get("所属机位")),
             }
     return result
 
@@ -216,6 +259,7 @@ def cabinet_slot_state(slot, taken, pending):
 def cabinet_options(exclude_server=None):
     exclude_key = clean_value(exclude_server)
     occupied = occupied_slots(exclude_key)
+    occupied_ranges = occupied_slot_ranges(exclude_key)
     pending_states = pending_server_slot_states()
     implementation_states = implementation_slot_states()
     rooms = {}
@@ -224,20 +268,25 @@ def cabinet_options(exclude_server=None):
         cabinet_name = cabinet["机柜"]
         room = rooms.setdefault(room_name, {"name": room_name, "cabinets": []})
         taken = occupied.get((room_name, cabinet_name), {})
+        taken_ranges = occupied_ranges.get((room_name, cabinet_name), {})
         pending = {
             **implementation_states.get((room_name, cabinet_name), {}),
             **pending_states.get((room_name, cabinet_name), {}),
         }
+        slots = []
+        for slot in positions(cabinet["机位"]):
+            state = cabinet_slot_state(slot, taken, pending)
+            item = {"slot": str(slot), **state}
+            # owner_range：占用者占用的完整机位范围（对方多行时交换需整段对调）
+            item["owner_range"] = taken_ranges.get(slot) or state.get("slot_range", "")
+            slots.append(item)
         room["cabinets"].append({
             "name": cabinet_name,
             "range": cabinet["机位"],
             "power": cabinet.get("瓦数(kw)", cabinet.get("瓦数(w)", "")),
             "annual_cost": cabinet["费用(年)"],
             "ip_ranges": {field: cabinet.get(range_field, "") for field, range_field in IP_RANGE_FIELDS.items()},
-            "slots": [
-                {"slot": str(slot), **cabinet_slot_state(slot, taken, pending)}
-                for slot in positions(cabinet["机位"])
-            ],
+            "slots": slots,
         })
     for room in rooms.values():
         room["cabinets"].sort(key=lambda x: x["name"])
@@ -356,7 +405,7 @@ def apply_customer_name(row, customer_map=None):
     return data
 
 
-def validate_record(entity, row, existing=None, exclude_record_key=None):
+def validate_record(entity, row, existing=None, exclude_record_key=None, allow_occupied_slots=False):
     entity = normalize_entity(entity)
     meta = ENTITIES[entity]
     errors = []
@@ -397,10 +446,11 @@ def validate_record(entity, row, existing=None, exclude_record_key=None):
             if not server_slots or not set(server_slots).issubset(cabinet_slots):
                 errors.append(f"所属机位 {normalized['所属机位']} 超出机柜登记范围 {cabinet_record['机位']}")
         taken = occupied_slots(exclude_record_key).get((room, cabinet_name), {})
-        for slot in server_slots:
-            if slot in taken:
-                errors.append(f"所属机位 {slot} 已被服务器 {taken[slot]} 占用")
-                break
+        if not allow_occupied_slots:
+            for slot in server_slots:
+                if slot in taken:
+                    errors.append(f"所属机位 {slot} 已被服务器 {taken[slot]} 占用")
+                    break
         errors.extend(same_kind_ip_conflict_errors(normalized))
     if existing is not None:
         key = record_key(meta, normalized)
@@ -601,6 +651,32 @@ def submit_change(entity, operation, record_key_value, new_data=None, submitter=
     return change_id
 
 
+def submit_and_approve_change(entity, operation, record_key_value, new_data=None, submitter="", reviewer=""):
+    """管理员直改：在单个事务内提交变更并立即批准生效。
+
+    复用 apply_review_action 的批准内核（approve_change + 版本记录 + 审计事件 + 待审核 Excel 同步），
+    因此与常规审批相比只是省略了人工点击这一步，其余行为（版本、审计、留痕）完全一致。
+    返回 change_id。
+    """
+    entity = normalize_entity(entity)
+    reviewer = reviewer or submitter
+    change_id = uuid.uuid4().hex[:12]
+    submitted_at = now_text()
+    with LOCK, db() as conn:
+        conn.execute("""INSERT INTO changes
+            (id,entity,operation,record_key,new_data,status,submitter,submitted_at)
+            VALUES (?,?,?,?,?,?,?,?)""", (
+            change_id, entity, operation, record_key_value,
+            json.dumps(new_data, ensure_ascii=False) if new_data else None,
+            "pending", submitter, submitted_at,
+        ))
+        change = conn.execute("SELECT * FROM changes WHERE id=?", (change_id,)).fetchone()
+        apply_review_action(conn, change, {"action": "approve"}, reviewer=reviewer, event_title="管理员变更直接生效")
+        storage.prune_audit_records(conn)
+        storage.sync_pending_excel(conn)
+    return change_id
+
+
 def validate_final_new_data(entity, change, candidate, records):
     entity = normalize_entity(entity)
     meta = ENTITIES[entity]
@@ -620,6 +696,9 @@ def validate_final_new_data(entity, change, candidate, records):
 
 def approve_change(change, final_new_data=None, conn=None):
     entity = normalize_entity(change["entity"])
+    if change["operation"] == SWAP_OPERATION:
+        approve_slot_swap(change, conn)
+        return None
     meta = ENTITIES[entity]
     records = read_records(entity)
     new = final_new_data if final_new_data is not None else json.loads(change["new_data"]) if change["new_data"] else None
@@ -650,7 +729,7 @@ def create_version(conn, change, reviewer):
     return storage.create_version_record(conn, change["id"], change["entity"], change["operation"], change["record_key"], reviewer)
 
 
-def apply_review_action(conn, change, body, reviewer, version_code=None):
+def apply_review_action(conn, change, body, reviewer, version_code=None, event_title=None):
     action = body.get("action")
     if action == "approve":
         final_new_data = body.get("new_data") if "new_data" in body else None
@@ -671,13 +750,235 @@ def apply_review_action(conn, change, body, reviewer, version_code=None):
         event_change["reviewed_at"] = reviewed_at
         if approved_data is not None:
             event_change["new_data"] = json.dumps(approved_data, ensure_ascii=False)
-        notify_audit_event(conn, operation_change_event(event_change, "approved", "操作审核已通过", reviewer))
+        notify_audit_event(conn, operation_change_event(event_change, "approved", event_title or "操作审核已通过", reviewer))
     else:
         event_change = dict(change)
         event_change["reviewed_at"] = reviewed_at
         event_change["reject_reason"] = body.get("reason", "")
         notify_audit_event(conn, operation_change_event(event_change, "rejected", "操作审核已驳回", reviewer))
     return message
+
+
+SWAP_OPERATION = "交换机位"
+
+
+def _slot_matches(room, cabinet_name, slot, target_room, target_cabinet, target_slot):
+    """判断记录 (机房, 机柜, 机位范围) 是否覆盖目标机位。"""
+    if clean_value(room) != clean_value(target_room) or clean_value(cabinet_name) != clean_value(target_cabinet):
+        return False
+    return str(target_slot) in {str(pos) for pos in positions(slot)}
+
+
+def slot_swap_target(room, cabinet_name, slot, exclude_server=""):
+    """定位某机位上当前的占用者，返回可作为交换对象的载体信息。
+
+    优先级与机柜统计/机位选择器一致：待审核变更 > 待实施请求 > 正式记录。
+    返回结构：{kind, key, room, cabinet, slot, slots?, change_id?, request_id?, server?}
+    其中 slot 为被点击的单个机位，slots 为占用者占用的**完整机位范围**（可能多行），
+    交换需按 slots 整段对调。
+    """
+    room, cabinet_name, slot = clean_value(room), clean_value(cabinet_name), str(slot)
+    exclude = clean_value(exclude_server)
+    meta = ENTITIES["servers"]
+
+    with db() as conn:
+        pending_rows = conn.execute(
+            "SELECT id,operation,record_key,new_data FROM changes "
+            "WHERE status='pending' AND entity='servers' AND operation IN ('新增','修改')"
+        ).fetchall()
+    for row in pending_rows:
+        if not row["new_data"]:
+            continue
+        data = normalize_row("servers", json.loads(row["new_data"]))
+        if record_key(meta, data) == exclude:
+            continue
+        if _slot_matches(data.get("所在机房"), data.get("所属机柜"), data.get("所属机位"), room, cabinet_name, slot):
+            return {
+                "kind": "pending_change",
+                "key": record_key(meta, data),
+                "room": room,
+                "cabinet": cabinet_name,
+                "slot": slot,
+                "slots": clean_value(data.get("所属机位")),
+                "change_id": row["id"],
+                "pending_operation": row["operation"],
+                "server": data,
+            }
+
+    with db() as conn:
+        request_rows = conn.execute(
+            "SELECT id,serial_number,stage_data FROM rack_requests "
+            "WHERE status='pending' AND stage='implementation' AND request_type='上架'"
+        ).fetchall()
+    for row in request_rows:
+        data = parse_json_dict(row["stage_data"])
+        if _slot_matches(data.get("所在机房"), data.get("所属机柜"), data.get("所属机位"), room, cabinet_name, slot):
+            return {
+                "kind": "rack_request",
+                "key": clean_value(row["serial_number"]),
+                "room": room,
+                "cabinet": cabinet_name,
+                "slot": slot,
+                "slots": clean_value(data.get("所属机位")),
+                "request_id": row["id"],
+                "server": data,
+            }
+
+    for server in read_records("servers"):
+        if record_key(meta, server) == exclude:
+            continue
+        if _slot_matches(server.get("所在机房"), server.get("所属机柜"), server.get("所属机位"), room, cabinet_name, slot):
+            return {
+                "kind": "official",
+                "key": record_key(meta, server),
+                "room": room,
+                "cabinet": cabinet_name,
+                "slot": slot,
+                "slots": clean_value(server.get("所属机位")),
+                "server": server,
+            }
+    return None
+
+
+def build_swap_change_data(self_new, self_old, target):
+    """构造交换机位单的 new_data 载荷（我方新数据 + 对方载体引用）。"""
+    meta = ENTITIES["servers"]
+    return {
+        "kind": "slot_swap",
+        "self": self_new,
+        "self_key": record_key(meta, self_new),
+        "self_from": {
+            "room": clean_value(self_old.get("所在机房")),
+            "cabinet": clean_value(self_old.get("所属机柜")),
+            "slot": clean_value(self_old.get("所属机位")),
+        },
+        "target": {
+            "kind": target["kind"],
+            "key": target["key"],
+            "change_id": target.get("change_id", ""),
+            "request_id": target.get("request_id", ""),
+            "from": {
+                "room": clean_value(target.get("room")),
+                "cabinet": clean_value(target.get("cabinet")),
+                # 对方完整机位范围（可能多行），交换按整段对调
+                "slot": clean_value(target.get("slots") or target.get("slot")),
+            },
+        },
+    }
+
+
+def pending_swap_for_record(entity, record_key_value, conn=None):
+    """该服务器是否处于待审核的交换机位单中（作为我方或对方）。"""
+    entity = normalize_entity(entity)
+    if entity != "servers":
+        return None
+    owns = conn is None
+    conn = conn or db()
+    rows = conn.execute(
+        "SELECT id,record_key,new_data FROM changes WHERE status='pending' AND entity='servers' AND operation=?",
+        (SWAP_OPERATION,),
+    ).fetchall()
+    if owns:
+        conn.close()
+    for row in rows:
+        data = parse_json_dict(row["new_data"])
+        if clean_value(row["record_key"]) == clean_value(record_key_value):
+            return dict(row)
+        target = data.get("target") or {}
+        if clean_value(target.get("key")) == clean_value(record_key_value):
+            return dict(row)
+    return None
+
+
+def submit_slot_swap(self_new, self_old, target, submitter=""):
+    """提交机位交换单：我方服务器生成一条「交换机位」变更，对方载体在审批时联动改写。"""
+    self_new = normalize_row("servers", self_new)
+    payload = build_swap_change_data(self_new, self_old or {}, target)
+    return submit_change("servers", SWAP_OPERATION, payload["self_key"], payload, submitter=submitter)
+
+
+def submit_and_approve_slot_swap(self_new, self_old, target, submitter="", reviewer=""):
+    """管理员直改：单个事务内提交并批准一次机位交换。"""
+    self_new = normalize_row("servers", self_new)
+    payload = build_swap_change_data(self_new, self_old or {}, target)
+    reviewer = reviewer or submitter
+    change_id = uuid.uuid4().hex[:12]
+    submitted_at = now_text()
+    with LOCK, db() as conn:
+        conn.execute("""INSERT INTO changes
+            (id,entity,operation,record_key,new_data,status,submitter,submitted_at)
+            VALUES (?,?,?,?,?,?,?,?)""", (
+            change_id, "servers", SWAP_OPERATION, payload["self_key"],
+            json.dumps(payload, ensure_ascii=False), "pending", submitter, submitted_at,
+        ))
+        change = conn.execute("SELECT * FROM changes WHERE id=?", (change_id,)).fetchone()
+        apply_review_action(conn, change, {"action": "approve"}, reviewer=reviewer, event_title="管理员机位交换直接生效")
+        storage.prune_audit_records(conn)
+        storage.sync_pending_excel(conn)
+    return change_id
+
+
+def _apply_swap_to_pending_target(conn, data, target):
+    """把对方（待审核变更 / 待实施请求）的机位改写为我方原位置。"""
+    self_from = data.get("self_from") or {}
+    to_room = clean_value(self_from.get("room"))
+    to_cabinet = clean_value(self_from.get("cabinet"))
+    to_slot = clean_value(self_from.get("slot"))
+    kind = target.get("kind")
+    if kind == "pending_change":
+        row = conn.execute("SELECT id,new_data,status FROM changes WHERE id=?", (target.get("change_id"),)).fetchone()
+        if not row or row["status"] != "pending":
+            raise ValueError("交换对象对应的待审核申请已变化，请刷新后重试")
+        payload = json.loads(row["new_data"]) if row["new_data"] else {}
+        payload["所在机房"] = to_room
+        payload["所属机柜"] = to_cabinet
+        payload["所属机位"] = to_slot
+        conn.execute("UPDATE changes SET new_data=? WHERE id=?", (json.dumps(payload, ensure_ascii=False), row["id"]))
+        return
+    if kind == "rack_request":
+        row = conn.execute(
+            "SELECT id,stage_data,status FROM rack_requests WHERE id=?", (target.get("request_id"),)
+        ).fetchone()
+        if not row or row["status"] != "pending":
+            raise ValueError("交换对象对应的上下架请求已变化，请刷新后重试")
+        payload = parse_json_dict(row["stage_data"])
+        payload["所在机房"] = to_room
+        payload["所属机柜"] = to_cabinet
+        payload["所属机位"] = to_slot
+        conn.execute("UPDATE rack_requests SET stage_data=? WHERE id=?", (json.dumps(payload, ensure_ascii=False), row["id"]))
+        return
+
+
+def approve_slot_swap(change, conn):
+    """交换机位单批准：我方写入新机位，对方按载体类型联动。"""
+    data = json.loads(change["new_data"]) if change["new_data"] else {}
+    if data.get("kind") != "slot_swap":
+        raise ValueError("交换申请数据无效")
+    meta = ENTITIES["servers"]
+    self_new = normalize_row("servers", data.get("self") or {})
+    self_key = change["record_key"]
+    target = data.get("target") or {}
+    records = read_records("servers")
+    idx = next((i for i, x in enumerate(records) if record_key(meta, x) == self_key), None)
+    if idx is None:
+        raise ValueError(f"服务器 {self_key} 已不存在，无法完成交换")
+    if target.get("kind") == "official":
+        peer_key = clean_value(target.get("key"))
+        peer_idx = next((i for i, x in enumerate(records) if record_key(meta, x) == peer_key), None)
+        if peer_idx is None:
+            raise ValueError(f"交换对象 {peer_key} 已不存在，无法完成交换")
+        self_from = data.get("self_from") or {}
+        peer = dict(records[peer_idx])
+        peer["所在机房"] = clean_value(self_from.get("room"))
+        peer["所属机柜"] = clean_value(self_from.get("cabinet"))
+        peer["所属机位"] = clean_value(self_from.get("slot"))
+        records[idx] = self_new
+        records[peer_idx] = peer
+        write_records("servers", records)
+        return
+    records[idx] = self_new
+    write_records("servers", records)
+    _apply_swap_to_pending_target(conn, data, target)
 
 
 def normalize_rack_request(row):

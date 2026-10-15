@@ -92,6 +92,20 @@ def forbidden(message="无权访问"):
     return jsonify(error=message), 403
 
 
+def is_admin_user(user=None):
+    return (user or current_user())["身份"] == ROLE_ADMIN
+
+
+def apply_change(entity, operation, key, row=None, user=None):
+    """按角色决定变更生效方式：管理员直接生效（免审批），其他角色提交待审批。返回 change_id。"""
+    user = user or current_user()
+    if user["身份"] == ROLE_ADMIN:
+        return services.submit_and_approve_change(
+            entity, operation, key, row, submitter=user["用户id"], reviewer=user["用户id"]
+        )
+    return services.submit_change(entity, operation, key, row, submitter=user["用户id"])
+
+
 def ensure_entity_view_response(entity):
     if normalize_entity(entity) not in ENTITIES:
         return jsonify(error="未知数据类型"), 404
@@ -143,6 +157,20 @@ def download_filling_instructions():
         as_attachment=True,
         download_name="信息维护填写说明.md",
         mimetype="text/markdown; charset=utf-8",
+    )
+
+
+@bp.get("/api/skill/download")
+@require_login
+def download_skill():
+    skill_zip_path = storage.STATE["config"].get("skill_zip_path")
+    if not skill_zip_path or not Path(skill_zip_path).is_file():
+        return jsonify({"error": "skill 压缩包未配置或文件不存在，请联系管理员设置 skill_zip_path"}), 404
+    return send_file(
+        Path(skill_zip_path),
+        as_attachment=True,
+        download_name="server_management_skill.zip",
+        mimetype="application/zip",
     )
 
 
@@ -345,8 +373,10 @@ def add_entity(entity):
         return jsonify(error="；".join(errors)), 400
     from .core import record_key
 
-    change_id = services.submit_change(entity, "新增", record_key(ENTITIES[entity], row), row, submitter=current_user()["用户id"])
-    return jsonify(message="已提交新增申请", change_id=change_id)
+    user = current_user()
+    change_id = apply_change(entity, "新增", record_key(ENTITIES[entity], row), row, user)
+    message = "已保存并直接生效" if is_admin_user(user) else "已提交新增申请"
+    return jsonify(message=message, change_id=change_id)
 
 
 @bp.post("/api/<entity>/import")
@@ -412,16 +442,18 @@ def import_entity(entity):
             file_seen.add(key)
     if row_errors:
         return jsonify(error="导入校验失败", details=row_errors), 400
-    submitter = current_user()["用户id"]
-    ids = [services.submit_change(entity, operation, key, row, submitter=submitter) for key, operation, row in accepted]
+    user = current_user()
+    ids = [apply_change(entity, operation, key, row, user) for key, operation, row in accepted]
     add_count = sum(1 for _, operation, _ in accepted if operation == "新增")
     update_count = sum(1 for _, operation, _ in accepted if operation == "修改")
+    direct = is_admin_user(user)
     parts = []
     if add_count:
-        parts.append(f"{add_count} 条新增申请")
+        parts.append(f"{add_count} 条新增" if direct else f"{add_count} 条新增申请")
     if update_count:
-        parts.append(f"{update_count} 条修改申请")
-    return jsonify(message="已提交 " + "，".join(parts), change_ids=ids)
+        parts.append(f"{update_count} 条修改" if direct else f"{update_count} 条修改申请")
+    message = ("已导入并直接生效：" if direct else "已提交 ") + "，".join(parts)
+    return jsonify(message=message, change_ids=ids)
 
 
 @bp.post("/api/<entity>/update")
@@ -451,8 +483,70 @@ def update_entity(entity):
     pending = services.pending_mutation_for_record(entity, old_key)
     if pending:
         return jsonify(error=f"记录 {old_key} 已有待审批{pending['operation']}申请，请切换到待审批状态处理"), 409
-    change_id = services.submit_change(entity, "修改", old_key, new, submitter=current_user()["用户id"])
-    return jsonify(message="已提交修改申请", change_id=change_id)
+    user = current_user()
+    change_id = apply_change(entity, "修改", old_key, new, user)
+    message = "已保存并直接生效" if is_admin_user(user) else "已提交修改申请"
+    return jsonify(message=message, change_id=change_id)
+
+
+@bp.post("/api/servers/swap-slot")
+@require_login
+def swap_server_slot():
+    """机位交换：我方服务器迁往目标机位，目标机位上的占用者（含在途载体）迁往我方原机位。"""
+    denied = ensure_entity_mutate_response("servers")
+    if denied:
+        return denied
+    from .core import normalize_row, record_key
+
+    body = request.get_json(silent=True) or {}
+    meta = ENTITIES["servers"]
+    old = normalize_row("servers", body.get("old") or {})
+    old_key = record_key(meta, old)
+    records = storage.read_records("servers")
+    current = next((x for x in records if record_key(meta, x) == old_key), None)
+    if not current:
+        return jsonify(error="原记录不存在或已变化，请刷新后重试"), 409
+    ref = body.get("target") or {}
+    room = clean_value(ref.get("room"))
+    cabinet_name = clean_value(ref.get("cabinet"))
+    slot = clean_value(ref.get("slot"))
+    errors = []
+    if not room or not cabinet_name or not slot:
+        errors.append("缺少交换目标机位")
+    target = None
+    if not errors:
+        target = services.slot_swap_target(room, cabinet_name, slot, exclude_server=old_key)
+        if not target:
+            errors.append("目标机位当前未被占用，无法交换")
+    new = None
+    if not errors:
+        # 机位范围以「对方占用者的完整机位范围」为准：对方可能占用多行，需整段对调
+        candidate = dict(body.get("new") or {})
+        candidate["所在机房"] = clean_value(target.get("room"))
+        candidate["所属机柜"] = clean_value(target.get("cabinet"))
+        candidate["所属机位"] = clean_value(target.get("slots") or target.get("slot"))
+        if (candidate["所在机房"], candidate["所属机柜"], candidate["所属机位"]) == (
+            current["所在机房"], current["所属机柜"], current["所属机位"],
+        ):
+            errors.append("交换目标与当前机位相同")
+        else:
+            new, errors = services.validate_record("servers", candidate, None, old_key, allow_occupied_slots=True)
+    if errors:
+        return jsonify(error="；".join(errors)), 400
+    for key in sorted({old_key, target["key"]}):
+        pending = services.pending_mutation_for_record("servers", key)
+        if pending and clean_value(target.get("change_id")) != pending["id"]:
+            return jsonify(error=f"服务器 {key} 已有待审批{pending['operation']}申请，请先处理"), 409
+        if services.pending_swap_for_record("servers", key):
+            return jsonify(error=f"服务器 {key} 已在其他机位交换申请中"), 409
+    user = current_user()
+    if is_admin_user(user):
+        change_id = services.submit_and_approve_slot_swap(
+            new, current, target, submitter=user["用户id"], reviewer=user["用户id"]
+        )
+        return jsonify(message="机位已交换并直接生效", change_id=change_id)
+    change_id = services.submit_slot_swap(new, current, target, submitter=user["用户id"])
+    return jsonify(message="已提交机位交换申请", change_id=change_id)
 
 
 @bp.post("/api/<entity>/delete")
@@ -472,8 +566,10 @@ def delete_entity(entity):
     pending = services.pending_mutation_for_record(entity, key)
     if pending:
         return jsonify(error=f"记录 {key} 已有待审批{pending['operation']}申请，请切换到待审批状态处理"), 409
-    change_id = services.submit_change(entity, "删除", key, submitter=current_user()["用户id"])
-    return jsonify(message="已提交删除申请", change_id=change_id)
+    user = current_user()
+    change_id = apply_change(entity, "删除", key, None, user)
+    message = "已删除并直接生效" if is_admin_user(user) else "已提交删除申请"
+    return jsonify(message=message, change_id=change_id)
 
 
 @bp.post("/api/<entity>/delete-batch")
@@ -495,7 +591,8 @@ def delete_entity_batch(entity):
     seen = set()
     change_ids = []
     errors = []
-    submitter = current_user()["用户id"]
+    user = current_user()
+    direct = is_admin_user(user)
     for index, target in enumerate(targets, 1):
         key = record_key(meta, normalize_row(entity, target or {}))
         if not key:
@@ -512,10 +609,12 @@ def delete_entity_batch(entity):
         if pending:
             errors.append({"index": index, "record_key": key, "error": f"记录已有待审批{pending['operation']}申请，请切换到待审批状态处理"})
             continue
-        change_ids.append(services.submit_change(entity, "删除", key, submitter=submitter))
+        change_ids.append(apply_change(entity, "删除", key, None, user))
     if errors:
-        return jsonify(error="部分记录无法提交删除申请", details=errors, change_ids=change_ids, submitted=len(change_ids)), 409
-    return jsonify(message=f"已提交 {len(change_ids)} 条删除申请", change_ids=change_ids, submitted=len(change_ids))
+        action = "部分记录无法直接删除" if direct else "部分记录无法提交删除申请"
+        return jsonify(error=action, details=errors, change_ids=change_ids, submitted=len(change_ids)), 409
+    message = f"已删除并直接生效：{len(change_ids)} 条" if direct else f"已提交 {len(change_ids)} 条删除申请"
+    return jsonify(message=message, change_ids=change_ids, submitted=len(change_ids))
 
 
 @bp.get("/api/changes")
@@ -1153,6 +1252,10 @@ def statistics():
                 slot["status"] = pending["status"]
                 if pending["status"] in ("pending_occupied", "pending_implementation"):
                     slot["pending_server"] = pending["server"]
+                if pending.get("change_id"):
+                    slot["pending_change_id"] = pending["change_id"]
+                if pending.get("request_id"):
+                    slot["pending_request_id"] = pending["request_id"]
 
     def slot_num(value):
         try:
@@ -1163,7 +1266,27 @@ def statistics():
     for cabinet in result:
         cabinet["slots"].sort(key=lambda x: slot_num(x["slot"]), reverse=True)
     result.sort(key=lambda x: (x["room"], x["name"]))
-    return jsonify(summary={"cabinet_count": len(result), "server_count": len(servers), "client_count": len(customers)}, cabinets=result)
+    rooms = []
+    room_index = {}
+    for cabinet in result:
+        room_name = cabinet["room"] or "未指定机房"
+        room = room_index.get(room_name)
+        if room is None:
+            room = {"name": room_name, "cabinet_count": 0, "slot_total": 0, "slot_occupied": 0, "cabinets": []}
+            room_index[room_name] = room
+            rooms.append(room)
+        room["cabinets"].append(cabinet)
+        room["cabinet_count"] += 1
+        for slot in cabinet["slots"]:
+            room["slot_total"] += 1
+            if slot.get("status") and slot["status"] != "free":
+                room["slot_occupied"] += 1
+    rooms.sort(key=lambda x: x["name"])
+    return jsonify(
+        summary={"cabinet_count": len(result), "server_count": len(servers), "client_count": len(customers)},
+        cabinets=result,
+        rooms=rooms,
+    )
 
 
 @bp.get("/health")
