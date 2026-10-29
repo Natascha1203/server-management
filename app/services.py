@@ -18,6 +18,7 @@ from .core import (
     RACK_REQUEST_EXPORT_HEADERS,
     RACK_REQUEST_META,
     clean_value,
+    date_text,
     entity_meta,
     filter_records_for_user,
     initial_rack_request_stage,
@@ -32,6 +33,7 @@ from .core import (
     record_key,
     sort_records,
     summarize_record,
+    today_text,
     is_valid_ipv4_or_cidr,
     allocatable_ip,
     ip_last_octet,
@@ -1179,6 +1181,16 @@ def rack_request_export_records(rows):
     return records
 
 
+def rack_request_rack_date(row):
+    """上下架请求对应的服务器记录「上架时间」默认值：取请求提交日期。
+
+    只取到日期（YYYY-MM-DD）：提交上下架请求即视为当天上架；机位IP分配 / 具体实施
+    阶段可以在表单里改这个日期，改了就以表单值优先（见 rack_server_draft）。
+    """
+    submitted_at = row["submitted_at"] if "submitted_at" in row.keys() else ""
+    return date_text(submitted_at, today_text())
+
+
 def rack_server_draft(row, override=None):
     data = parse_json_dict(row["request_data"])
     stage_data = parse_json_dict(row["stage_data"] if "stage_data" in row.keys() else "{}")
@@ -1190,6 +1202,11 @@ def rack_server_draft(row, override=None):
         "客户id": override.get("客户id") or stage_data.get("客户id") or data.get("客户id", ""),
         "客户名称": override.get("客户名称") or stage_data.get("客户名称") or data.get("客户名称", ""),
         "所在机房": override.get("所在机房") or stage_data.get("所在机房") or data.get("所在机房", ""),
+        # 分配/实施表单里手动填了上架时间就用它，否则回落到请求提交日期（不允许留空）
+        "上架时间": date_text(
+            override.get("上架时间") or stage_data.get("上架时间"),
+            rack_request_rack_date(row),
+        ),
     })
 
 

@@ -67,16 +67,35 @@ function customerInput(field, value = '', extra = '') {
 
 // 长文本字段：在编辑/审批表单中渲染为可调整大小的多行编辑框（textarea）
 const MULTILINE_FIELDS = ['防火墙白名单', '备注'];
+// 日期字段：渲染为 <input type="date">，取值统一为 YYYY-MM-DD
+const DATE_FIELDS = ['上架时间'];
 
 function isMultilineField(field) {
   return MULTILINE_FIELDS.includes(field);
 }
 
-// 统一字段控件：多行字段 -> textarea（可拖拽调整大小），其余 -> 单行 input
+function isDateField(field) {
+  return DATE_FIELDS.includes(field);
+}
+
+// date 控件的 value 只能是 YYYY-MM-DD，历史数据可能是 2026/9/1 之类，这里先归一
+function toDateInputValue(value) {
+  const text = String(value ?? '').trim();
+  const match = text.match(/^(\d{4})[-/.](\d{1,2})[-/.](\d{1,2})/);
+  if (!match) {
+    return /^\d{4}-\d{2}-\d{2}$/.test(text) ? text : '';
+  }
+  return `${match[1]}-${match[2].padStart(2, '0')}-${match[3].padStart(2, '0')}`;
+}
+
+// 统一字段控件：多行字段 -> textarea（可拖拽调整大小），日期字段 -> date，其余 -> 单行 input
 function textFieldInput(field, value = '', extra = '') {
   const text = value ?? '';
   if (isMultilineField(field)) {
     return `<textarea name="${esc(field)}" rows="4"${extra}>${esc(text)}</textarea>`;
+  }
+  if (isDateField(field)) {
+    return `<input type="date" name="${esc(field)}" value="${esc(toDateInputValue(text))}"${extra}>`;
   }
   return `<input name="${esc(field)}" value="${esc(text)}"${extra}>`;
 }
@@ -1388,9 +1407,17 @@ function versionCard(v) {
   return `<article class="review-card"><div class="review-top"><span class="tag">${esc(v.version_code)}</span><strong>${esc(v.entity_label)} · ${esc(v.operation)} · ${esc(v.record_key)}</strong><span class="review-time">${esc(v.reviewer)} · ${esc(v.created_at)}</span></div><p class="muted">对应审核申请：${esc(v.change_id)}。该版本完整保存了当时的三份正式 Excel。</p><div class="review-actions"><a class="btn ghost" href="/api/versions/${v.id}/cabinets/download">下载机柜表</a><a class="btn ghost" href="/api/versions/${v.id}/customers/download">下载客户表</a><a class="btn primary" href="/api/versions/${v.id}/servers/download">下载服务器表</a></div></article>`;
 }
 
+function todayDateText() {
+  const now = new Date();
+  const pad = n => String(n).padStart(2, '0');
+  return `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}`;
+}
+
 function serverDraftFromRackRequest(item) {
   const data = item.request_data || {};
   const stageData = item.stage_data || {};
+  // 上架时间：提交上下架请求时自动等于提交日期；分配/实施阶段改过就以改过的为准
+  const submittedDate = toDateInputValue(item.submitted_at) || todayDateText();
   return {
     ...data,
     ...stageData,
@@ -1399,6 +1426,7 @@ function serverDraftFromRackRequest(item) {
     '所在机房': stageData['所在机房'] || data['所在机房'] || '',
     '所属机柜': stageData['所属机柜'] || '',
     '所属机位': stageData['所属机位'] || '',
+    '上架时间': toDateInputValue(stageData['上架时间']) || submittedDate,
   };
 }
 

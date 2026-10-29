@@ -56,6 +56,23 @@ def now_text():
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 
+def today_text():
+    return datetime.now().strftime("%Y-%m-%d")
+
+
+def date_text(value, fallback=""):
+    """把 'YYYY-MM-DD HH:MM:SS' / 'YYYY/MM/DD' 之类的时间文本归一成 'YYYY-MM-DD'。
+
+    取不到日期时返回 fallback（用于「上架时间」这类只存日期的字段）。
+    """
+    text = clean_value(value)
+    match = re.match(r"\s*(\d{4})[-/.](\d{1,2})[-/.](\d{1,2})", text)
+    if not match:
+        return fallback
+    year, month, day = match.groups()
+    return f"{year}-{int(month):02d}-{int(day):02d}"
+
+
 def clean_value(value):
     if value is None:
         return ""
