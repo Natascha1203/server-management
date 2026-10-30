@@ -14,9 +14,12 @@ from .core import (
     IP_FIELDS,
     IP_RANGE_FIELDS,
     ROLE_ADMIN,
+    ROLE_BUSINESS,
+    ROLE_ROOM,
     RACK_REQUEST_HEADERS,
     RACK_REQUEST_EXPORT_HEADERS,
     RACK_REQUEST_META,
+    capabilities_for,
     clean_value,
     date_text,
     entity_meta,
@@ -1283,3 +1286,208 @@ def complete_rack_request(conn, row, user, server_data=None):
     event_row["reviewed_at"] = reviewed_at
     notify_rack_stage(conn, event_row, "approved", "服务器上下架具体实施已完成", user["用户id"], event_server_data)
     return f"服务器上下架具体实施已完成，已生成版本 {version_code}", []
+
+
+# ---------------------------------------------------------------- 服务器资料（附件）
+# 资料按「序列号」归属：上下架请求、机位IP分配、具体实施、服务器表看到的是同一份档案，
+# 因此实施完成落库成服务器记录后，服务器表里天然能看到同一批资料，无需二次搬迁。
+# 资料只存在于 attachments 表与 data/archive 目录，不进入任何 Excel 导出。
+
+
+def max_attachment_bytes():
+    config = storage.STATE.get("config") or {}
+    return int(config.get("max_upload_mb") or 64) * 1024 * 1024
+
+
+def visible_serials(user):
+    """当前用户可见的服务器序列号集合；返回 None 表示不限制（管理人员）。"""
+    if not user:
+        return set()
+    if user["身份"] == ROLE_ADMIN:
+        return None
+    keys = set()
+    with db() as conn:
+        rows = conn.execute("SELECT serial_number,request_data,stage_data,submitter_id FROM rack_requests").fetchall()
+    if user["身份"] == ROLE_ROOM:
+        room = user["所属机房"]
+        for server in read_records("servers"):
+            if server.get("所在机房") == room:
+                keys.add(clean_value(server.get("序列号")))
+        for row in rows:
+            data = parse_json_dict(row["request_data"])
+            stage_data = parse_json_dict(row["stage_data"])
+            if (stage_data.get("所在机房") or data.get("所在机房")) == room:
+                keys.add(clean_value(row["serial_number"]))
+    elif user["身份"] == ROLE_BUSINESS:
+        unit = user["业务单位"]
+        for server in read_records("servers"):
+            if server.get("归属单位") == unit:
+                keys.add(clean_value(server.get("序列号")))
+        for row in rows:
+            if row["submitter_id"] == user["用户id"]:
+                keys.add(clean_value(row["serial_number"]))
+    keys.discard("")
+    return keys
+
+
+def can_access_serial(serial_number, user):
+    serial = clean_value(serial_number)
+    if not serial or not user:
+        return False
+    visible = visible_serials(user)
+    return True if visible is None else serial in visible
+
+
+def can_upload_attachment(serial_number, user):
+    if not user:
+        return False
+    if not {"manage_all", "submit_rack_request", "review_rack_requests"} & set(capabilities_for(user)):
+        return False
+    return can_access_serial(serial_number, user)
+
+
+def attachment_can_manage(row, user, visible=None):
+    """谁能改/删某份资料：管理人员、上传者本人、以及该服务器所属机房的机房人员。"""
+    if not user:
+        return False
+    if user["身份"] == ROLE_ADMIN:
+        return True
+    if clean_value(row["uploader"]) == user["用户id"]:
+        return True
+    if user["身份"] == ROLE_ROOM:
+        if visible is None:
+            visible = visible_serials(user)
+        return True if visible is None else clean_value(row["serial_number"]) in visible
+    return False
+
+
+def attachment_to_json(row, user=None, visible=None):
+    return {
+        "id": row["id"],
+        "serial_number": clean_value(row["serial_number"]),
+        "filename": clean_value(row["filename"]),
+        "size": int(row["size"] or 0),
+        "uploader": clean_value(row["uploader"]),
+        "uploaded_at": clean_value(row["uploaded_at"]),
+        "request_id": clean_value(row["request_id"]),
+        "source": clean_value(row["source"]),
+        "can_manage": attachment_can_manage(row, user, visible),
+    }
+
+
+def list_attachments(serials=None, user=None):
+    """列出资料；serials 为 None 表示全部（仍按用户可见范围过滤）。"""
+    sql = "SELECT rowid,* FROM attachments"
+    params = []
+    if serials is not None:
+        wanted = [clean_value(item) for item in serials if clean_value(item)]
+        if not wanted:
+            return []
+        sql += f" WHERE serial_number IN ({','.join('?' * len(wanted))})"
+        params = wanted
+    sql += " ORDER BY uploaded_at DESC, rowid DESC"
+    with db() as conn:
+        rows = conn.execute(sql, params).fetchall()
+    # 可见范围只算一次（会读 Excel + 查 rack_requests），避免每条资料都重算
+    visible = visible_serials(user)
+    return [
+        attachment_to_json(row, user, visible)
+        for row in rows
+        if visible is None or clean_value(row["serial_number"]) in visible
+    ]
+
+
+def attachment_counts(user=None):
+    counts = {}
+    for item in list_attachments(None, user):
+        serial = item["serial_number"]
+        counts[serial] = counts.get(serial, 0) + 1
+    return counts
+
+
+def get_attachment(attachment_id):
+    with db() as conn:
+        return conn.execute("SELECT rowid,* FROM attachments WHERE id=?", (attachment_id,)).fetchone()
+
+
+def create_attachments(serial_number, files, user, request_id="", source=""):
+    serial = clean_value(serial_number)
+    if not serial:
+        raise ValueError("序列号不能为空")
+    uploader = clean_value(user["用户id"]) if user else ""
+    uploaded_at = now_text()
+    limit = max_attachment_bytes()
+    saved = []
+    try:
+        for uploaded in files:
+            filename = clean_value(getattr(uploaded, "filename", ""))
+            if not filename:
+                continue
+            attachment_id = uuid.uuid4().hex[:12]
+            stored_name, size = storage.save_attachment_file(attachment_id, serial, filename, uploaded)
+            if size > limit:
+                storage.delete_attachment_file(stored_name)
+                raise ValueError(f"文件 {filename} 超过 {limit // 1024 // 1024}MB 上传上限")
+            saved.append({
+                "id": attachment_id,
+                "serial_number": serial,
+                "filename": storage.safe_filename(filename),
+                "stored_name": stored_name,
+                "size": size,
+                "uploader": uploader,
+                "uploaded_at": uploaded_at,
+                "request_id": clean_value(request_id),
+                "source": clean_value(source),
+            })
+        if not saved:
+            raise ValueError("请选择要上传的文件")
+        with LOCK, db() as conn:
+            for item in saved:
+                conn.execute(
+                    """INSERT INTO attachments
+                       (id,serial_number,filename,stored_name,size,uploader,uploaded_at,request_id,source)
+                       VALUES (?,?,?,?,?,?,?,?,?)""",
+                    (
+                        item["id"], item["serial_number"], item["filename"], item["stored_name"],
+                        item["size"], item["uploader"], item["uploaded_at"], item["request_id"], item["source"],
+                    ),
+                )
+    except Exception:
+        for item in saved:
+            storage.delete_attachment_file(item["stored_name"])
+        raise
+    visible = visible_serials(user)
+    ids = [item["id"] for item in saved]
+    with db() as conn:
+        rows = conn.execute(
+            f"SELECT rowid,* FROM attachments WHERE id IN ({','.join('?' * len(ids))})", ids
+        ).fetchall()
+    by_id = {row["id"]: row for row in rows}
+    return [attachment_to_json(by_id[item["id"]], user, visible) for item in saved if item["id"] in by_id]
+
+
+def rename_attachment(attachment_id, filename, user):
+    row = get_attachment(attachment_id)
+    if not row:
+        raise LookupError("资料不存在或已被删除")
+    if not attachment_can_manage(row, user):
+        raise PermissionError("无权修改该资料")
+    new_name = storage.safe_filename(filename)
+    if not new_name:
+        raise ValueError("资料名称不能为空")
+    stored_name = storage.rename_attachment_file(row["stored_name"], row["id"], new_name)
+    with LOCK, db() as conn:
+        conn.execute("UPDATE attachments SET filename=?,stored_name=? WHERE id=?", (new_name, stored_name, attachment_id))
+    return attachment_to_json(get_attachment(attachment_id), user)
+
+
+def delete_attachment(attachment_id, user):
+    row = get_attachment(attachment_id)
+    if not row:
+        raise LookupError("资料不存在或已被删除")
+    if not attachment_can_manage(row, user):
+        raise PermissionError("无权删除该资料")
+    with LOCK, db() as conn:
+        conn.execute("DELETE FROM attachments WHERE id=?", (attachment_id,))
+    storage.delete_attachment_file(row["stored_name"])
+    return attachment_to_json(row, user)

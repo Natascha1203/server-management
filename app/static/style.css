@@ -109,3 +109,24 @@ mark{background:#ffe9a8;color:inherit;padding:0 2px;border-radius:3px}
 .field-combo .combo-option.on{color:#137f74;font-weight:700}
 .field-combo .combo-empty{padding:9px 10px;font-size:12px;color:var(--muted)}
 .field-combo .combo-empty[hidden]{display:none}
+
+/* ==== 服务器资料（附件）==== */
+.mini.attach{background:#eef2fd;color:#3a5fd0}
+.attachment-form-row{grid-column:1/-1;display:flex;flex-direction:column;gap:8px;background:#f6f9fb;border:1px dashed #cfe0e6;border-radius:10px;padding:12px 14px}
+.attachment-form-row input[type=file]{width:100%;border:1px solid #d9e2e8;border-radius:8px;background:#fff;padding:9px 10px;font-size:13px}
+.attachment-block{margin-top:14px;border:1px solid #e4e9ed;border-radius:10px;background:#f9fbfc;padding:12px 14px}
+.attachment-head{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+.attachment-head b{color:#17344b;font-size:13px}
+.attachment-head .muted{font-size:12px}
+.attachment-head .attachment-upload{margin-left:auto;min-height:32px;font-size:12px;padding:5px 12px}
+.attachment-list{list-style:none;margin:10px 0 0;padding:0;display:flex;flex-direction:column;gap:6px}
+.attachment-item{display:flex;align-items:center;gap:12px;background:#fff;border:1px solid #e6edf1;border-radius:8px;padding:8px 10px;font-size:12px}
+.attachment-name{color:#147e74;font-weight:600;text-decoration:none;max-width:46%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.attachment-name:hover{text-decoration:underline}
+.attachment-meta{flex:1;color:var(--muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.attachment-ops{display:flex;gap:6px;flex:0 0 auto}
+.attachment-empty{margin:8px 0 0;color:var(--muted);font-size:12px}
+.attachment-list li.attachment-empty{margin:0;padding:6px 2px}
+.modal-panel.attachment-modal-panel{width:min(680px,96vw)}
+.modal-panel.attachment-modal-panel .attachment-block{margin-top:0}
+@media(max-width:900px){.attachment-item{flex-wrap:wrap;gap:6px}.attachment-name{max-width:100%}.attachment-meta{flex:1 1 100%}}

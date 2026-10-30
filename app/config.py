@@ -124,6 +124,7 @@ def load_config(config_path=None):
         "data_dir": data_dir,
         "secret_key": secret_key,
         "max_versions": max_versions,
+        "max_upload_mb": parser.getint("app", "max_upload_mb", fallback=64) or 64,
         "reset": 1 if parser.getboolean("app", "reset", fallback=False) else 0,
         "backup_keep_count": backup_keep_count,
         "backup_command": parser.get("app", "backup_command", fallback="").strip(),

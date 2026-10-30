@@ -11,6 +11,8 @@ import csv
 import io
 import json
 import logging
+import os
+import re
 import shutil
 import sqlite3
 import subprocess
@@ -45,6 +47,7 @@ STATE = {
     "temp_dir": None,
     "versions_dir": None,
     "backups_dir": None,
+    "archive_dir": None,
     "db_path": None,
     "pending_path": None,
 }
@@ -58,6 +61,7 @@ def init_runtime(config):
     STATE["temp_dir"] = data_dir / "temp"
     STATE["versions_dir"] = data_dir / "versions"
     STATE["backups_dir"] = data_dir / "backups"
+    STATE["archive_dir"] = data_dir / "archive"
     STATE["db_path"] = data_dir / "app.db"
     STATE["pending_path"] = STATE["temp_dir"] / "待审核变更.xlsx"
 
@@ -120,6 +124,25 @@ SETTINGS_SCHEMA = """CREATE TABLE IF NOT EXISTS settings (
     value TEXT NOT NULL
 )"""
 
+# 服务器资料（附件）：按「序列号」归属，跨上下架请求 / 机位IP分配 / 具体实施 / 服务器表共用同一份档案。
+# 文件本体落在 data/archive/<序列号>/ 下，这里只存元数据与相对路径。
+ATTACHMENTS_SCHEMA = """CREATE TABLE IF NOT EXISTS attachments (
+    id TEXT PRIMARY KEY,
+    serial_number TEXT NOT NULL,
+    filename TEXT NOT NULL,
+    stored_name TEXT NOT NULL,
+    size INTEGER NOT NULL DEFAULT 0,
+    uploader TEXT NOT NULL,
+    uploaded_at TEXT NOT NULL,
+    request_id TEXT NOT NULL DEFAULT '',
+    source TEXT NOT NULL DEFAULT ''
+)"""
+
+# 文件名 / 目录名里不允许出现的字符（含 Windows 保留字符与控制字符）
+UNSAFE_NAME_PATTERN = re.compile(r'[\\/:*?"<>|\x00-\x1f]')
+ARCHIVE_NAME_MAX = 120
+ARCHIVE_FOLDER_MAX = 60
+
 
 def ensure_changes_schema(conn):
     conn.execute(CHANGES_SCHEMA)
@@ -161,6 +184,111 @@ def ensure_rack_requests_schema(conn):
     conn.execute("UPDATE rack_requests SET stage='completed' WHERE status='approved' AND (stage IS NULL OR stage='')")
     conn.execute("UPDATE rack_requests SET stage='rejected' WHERE status='rejected' AND (stage IS NULL OR stage='')")
     conn.execute("UPDATE rack_requests SET stage_data='{}' WHERE stage_data IS NULL OR stage_data=''")
+
+
+def ensure_attachments_schema(conn):
+    conn.execute(ATTACHMENTS_SCHEMA)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_attachments_serial ON attachments(serial_number)")
+    # 早期版本可能没有这两列，补齐以免 SELECT 报错
+    add_column_if_missing(conn, "attachments", "request_id", "request_id TEXT NOT NULL DEFAULT ''")
+    add_column_if_missing(conn, "attachments", "source", "source TEXT NOT NULL DEFAULT ''")
+
+
+def archive_root():
+    return STATE["archive_dir"]
+
+
+def safe_filename(name, max_length=ARCHIVE_NAME_MAX):
+    """清洗用户上传的文件名：去掉路径、控制字符与 Windows 保留字符，保留中文。"""
+    text = clean_value(name).replace("\\", "/").split("/")[-1]
+    text = UNSAFE_NAME_PATTERN.sub("_", text).strip().strip(".")
+    if not text:
+        text = "file"
+    if len(text) > max_length:
+        stem, dot, ext = text.rpartition(".")
+        if dot and 0 < len(ext) <= 12:
+            stem = stem[: max_length - len(ext) - 1]
+            text = f"{stem}.{ext}" if stem else f"file.{ext}"
+        else:
+            text = text[:max_length]
+    return text
+
+
+def archive_folder_name(serial_number):
+    folder = UNSAFE_NAME_PATTERN.sub("_", clean_value(serial_number)).strip(" .")
+    return (folder or "未命名")[:ARCHIVE_FOLDER_MAX]
+
+
+def archive_path(stored_name):
+    """把数据库里的相对路径还原成绝对路径，并保证不会越出 archive 目录。"""
+    root = archive_root().resolve()
+    candidate = (root / Path(*str(stored_name).replace("\\", "/").split("/"))).resolve()
+    if candidate != root and root not in candidate.parents:
+        raise ValueError("附件路径非法")
+    return candidate
+
+
+def save_attachment_file(attachment_id, serial_number, filename, file_storage):
+    """落盘并返回 (相对路径, 字节数)。相对路径相对 data/archive，统一用 / 分隔。"""
+    folder = archive_root() / archive_folder_name(serial_number)
+    folder.mkdir(parents=True, exist_ok=True)
+    target = folder / f"{attachment_id}_{safe_filename(filename)}"
+    stream = getattr(file_storage, "stream", None)
+    size = 0
+    if stream is not None:
+        try:
+            stream.seek(0, os.SEEK_END)
+            size = int(stream.tell())
+        except (OSError, ValueError):
+            size = 0
+        try:
+            stream.seek(0)
+        except (OSError, ValueError):
+            pass
+    file_storage.save(str(target))
+    if not size:
+        try:
+            size = target.stat().st_size
+        except OSError:
+            size = 0
+    return target.resolve().relative_to(archive_root().resolve()).as_posix(), size
+
+
+def rename_attachment_file(stored_name, attachment_id, filename):
+    """重命名磁盘文件（保留 id 前缀），返回新的相对路径。"""
+    old_path = archive_path(stored_name)
+    target = old_path.parent / f"{attachment_id}_{safe_filename(filename)}"
+    if target != old_path:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            os.replace(old_path, target)
+        except FileNotFoundError:
+            # 文件已丢失：只更新元数据，避免重命名直接报错
+            logger.warning("attachment file missing on rename path=%s", old_path)
+    return target.resolve().relative_to(archive_root().resolve()).as_posix()
+
+
+def delete_attachment_file(stored_name):
+    try:
+        path = archive_path(stored_name)
+    except ValueError:
+        logger.warning("skip deleting attachment outside archive dir stored_name=%s", stored_name)
+        return False
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        pass
+    except OSError:
+        logger.exception("failed to delete attachment file path=%s", path)
+        return False
+    # 顺带清理空的 <序列号> 目录，保持 archive 干净
+    parent = path.parent
+    try:
+        if parent != archive_root().resolve() and parent.is_dir() and not any(parent.iterdir()):
+            parent.rmdir()
+    except OSError:
+        pass
+    return True
 
 
 def ensure_default_settings(conn):
@@ -361,12 +489,14 @@ def init_storage():
     STATE["temp_dir"].mkdir(parents=True, exist_ok=True)
     STATE["versions_dir"].mkdir(parents=True, exist_ok=True)
     STATE["backups_dir"].mkdir(parents=True, exist_ok=True)
+    STATE["archive_dir"].mkdir(parents=True, exist_ok=True)
     for meta in ENTITIES.values():
         create_empty_workbook(meta)
     sync_official_workbook_headers()
     with db() as conn:
         ensure_changes_schema(conn)
         ensure_rack_requests_schema(conn)
+        ensure_attachments_schema(conn)
         conn.execute(SETTINGS_SCHEMA)
         conn.execute("CREATE INDEX IF NOT EXISTS idx_changes_status ON changes(status)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_rack_requests_status ON rack_requests(status)")

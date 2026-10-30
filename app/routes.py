@@ -1200,6 +1200,98 @@ def review_rack_request(request_id):
     return jsonify(message=message, request_id=request_id)
 
 
+# ---------------------------------------------------------------- 服务器资料（附件）
+# 资料按序列号归属，上下架请求 / 机位IP分配 / 具体实施 / 服务器表共用同一份档案。
+# 资料只存 attachments 表 + data/archive 目录，不进入任何 Excel/CSV 导出。
+
+@bp.get("/api/attachments")
+@require_login
+def attachments_api():
+    """列出资料：?serial=SN 或 ?serials=SN1,SN2；缺省返回当前用户可见的全部。"""
+    user = current_user()
+    raw = clean_value(request.args.get("serials") or request.args.get("serial"))
+    serials = [clean_value(item) for item in raw.split(",") if clean_value(item)] if raw else None
+    return jsonify(items=services.list_attachments(serials, user))
+
+
+@bp.get("/api/attachments/summary")
+@require_login
+def attachments_summary_api():
+    """各序列号的资料数量（服务器表里显示「资料 (N)」用）。"""
+    return jsonify(counts=services.attachment_counts(current_user()))
+
+
+@bp.post("/api/attachments")
+@require_login
+def upload_attachments_api():
+    user = current_user()
+    serial = clean_value(request.form.get("serial") or request.args.get("serial"))
+    if not serial:
+        return jsonify(error="序列号不能为空"), 400
+    if not services.can_upload_attachment(serial, user):
+        return forbidden("无权为该服务器上传资料")
+    files = request.files.getlist("files") or request.files.getlist("file")
+    files = [item for item in files if clean_value(getattr(item, "filename", ""))]
+    if not files:
+        return jsonify(error="请选择要上传的文件"), 400
+    try:
+        items = services.create_attachments(
+            serial,
+            files,
+            user,
+            request_id=clean_value(request.form.get("request_id")),
+            source=clean_value(request.form.get("source")),
+        )
+    except ValueError as exc:
+        return jsonify(error=str(exc)), 400
+    return jsonify(message=f"已上传 {len(items)} 个资料", items=items)
+
+
+@bp.get("/api/attachments/<attachment_id>/download")
+@require_login
+def download_attachment_api(attachment_id):
+    user = current_user()
+    row = services.get_attachment(attachment_id)
+    if not row:
+        return jsonify(error="资料不存在或已被删除"), 404
+    if not services.can_access_serial(row["serial_number"], user):
+        return forbidden()
+    try:
+        path = storage.archive_path(row["stored_name"])
+    except ValueError:
+        return jsonify(error="资料路径非法"), 400
+    if not path.is_file():
+        return jsonify(error="资料文件已丢失，请联系管理员从 data/archive 恢复"), 404
+    return send_file(path, as_attachment=True, download_name=row["filename"])
+
+
+@bp.post("/api/attachments/<attachment_id>/rename")
+@require_login
+def rename_attachment_api(attachment_id):
+    body = request.get_json(silent=True) or {}
+    try:
+        item = services.rename_attachment(attachment_id, body.get("filename"), current_user())
+    except LookupError as exc:
+        return jsonify(error=str(exc)), 404
+    except PermissionError as exc:
+        return forbidden(str(exc))
+    except ValueError as exc:
+        return jsonify(error=str(exc)), 400
+    return jsonify(message="资料名称已更新", attachment=item)
+
+
+@bp.route("/api/attachments/<attachment_id>/delete", methods=["POST", "DELETE"])
+@require_login
+def delete_attachment_api(attachment_id):
+    try:
+        services.delete_attachment(attachment_id, current_user())
+    except LookupError as exc:
+        return jsonify(error=str(exc)), 404
+    except PermissionError as exc:
+        return forbidden(str(exc))
+    return jsonify(message="资料已删除", attachment_id=attachment_id)
+
+
 @bp.get("/api/statistics")
 @require_login
 def statistics():

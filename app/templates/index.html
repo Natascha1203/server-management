@@ -138,6 +138,10 @@
         <label class="wide">防火墙白名单<textarea name="防火墙白名单"></textarea></label>
         <label class="wide">上下架需求<textarea name="上下架需求"></textarea></label>
         <label class="wide">备注<textarea name="备注"></textarea></label>
+        <div class="wide attachment-form-row">
+          <div class="attachment-head"><b>附件资料</b><span class="muted">可多选，随请求一并上传；提交后可在下方请求卡片里继续添加 / 重命名 / 删除</span></div>
+          <input id="rackRequestFiles" type="file" multiple>
+        </div>
         <div class="modal-actions wide"><button class="btn ghost" id="rackRequestCancelEditBtn" type="button" hidden>取消修改</button><button class="btn primary" id="rackRequestSubmitBtn" type="submit">提交上下架请求</button></div>
       </form>
       <div id="rackRequestStatusTabs" class="review-filters rack-request-tabs">
@@ -177,6 +181,7 @@
   <datalist id="customerIdOptions" data-customer-id-options></datalist>
   <datalist id="customerNameOptions" data-customer-name-options></datalist>
   <div id="modal" class="modal"><div class="modal-panel"><div class="modal-head"><div><p class="eyebrow" id="modalEyebrow">NEW RECORD</p><h2 id="modalTitle">新增记录</h2></div><button id="closeModal">×</button></div><form id="recordForm"><div id="formFields" class="form-grid"></div><div class="modal-actions"><button type="button" class="btn ghost" id="cancelModal">取消</button><button type="submit" class="btn primary">提交审核</button></div></form></div></div>
+  <div id="attachmentModal" class="modal"><div class="modal-panel attachment-modal-panel"><div class="modal-head"><div><p class="eyebrow">ARCHIVE</p><h2 id="attachmentModalTitle">服务器资料</h2></div><button id="closeAttachmentModal">×</button></div><div id="attachmentModalBody"></div></div></div>
   <div id="toast" class="toast"></div>
   <script>
     window.APP_ROLE={{ role|tojson }};

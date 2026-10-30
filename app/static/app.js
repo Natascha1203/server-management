@@ -2,7 +2,7 @@ const APP_CAPABILITIES = window.APP_CAPABILITIES || [];
 const APP_USER = window.APP_USER || {};
 const SERVER_APPROVAL_HEADERS = ['序列号', '品牌', '型号', 'CPU型号', '网卡', '服务器成本(万)', '归属单位', '用途分类', '用途', '防火墙白名单', '资源申请编号', '是否液冷', '客户id', '客户名称', '所在机房', '所属机柜', '所属机位', '管理ip', '交易ip', '带外ip', '管理密码', '带外密码', '上架时间', '接入行情', '接入柜台', '备注'];
 const RACK_REVIEW_FILTER_FIELDS = ['序列号', '客户id', '客户名称', '所在机房'];
-const state = { entity: 'cabinets', records: [], meta: null, editing: null, pendingEditing: null, rackEditing: null, rackRequestStatus: 'pending', status: 'pending', reviewMode: 'allocation', stats: null, filters: [], sorts: [], reviewFilters: [], rackRequestFilters: [], changes: [], rackRequests: [], rackApprovalOptions: { rooms: [] }, rackSlotPick: {}, rackRequestExpanded: [], rackReviewExpanded: [], systemUsers: [], customerOptions: [] };
+const state = { entity: 'cabinets', records: [], meta: null, editing: null, pendingEditing: null, rackEditing: null, rackRequestStatus: 'pending', status: 'pending', reviewMode: 'allocation', stats: null, filters: [], sorts: [], reviewFilters: [], rackRequestFilters: [], changes: [], rackRequests: [], rackApprovalOptions: { rooms: [] }, rackSlotPick: {}, rackRequestExpanded: [], rackReviewExpanded: [], systemUsers: [], customerOptions: [], attachmentMap: {}, attachmentCounts: {}, attachmentModalSerial: '' };
 const $ = s => document.querySelector(s);
 const $$ = s => [...document.querySelectorAll(s)];
 
@@ -232,6 +232,7 @@ async function loadEntity() {
   $('#downloadXlsxTemplateBtn').href = `/api/${state.entity}/template?format=xlsx`;
   $('#downloadCsvTemplateBtn').href = `/api/${state.entity}/template?format=csv`;
   $('#tableName').textContent = d.meta.label + '信息';
+  if (state.entity === 'servers') await loadAttachmentCounts();
   renderFilters();
   renderSorts();
   renderTable();
@@ -249,7 +250,8 @@ function renderTable() {
     const encoded = encodeURIComponent(JSON.stringify(stripPendingFields(r)));
     const editPending = pending && r._pending_operation !== '删除' ? `<button class="mini" onclick="openPendingEdit(${index})">编辑待审批</button>` : '';
     const pendingAction = pending ? `<button class="mini" onclick="showPendingChange(${index})">查看待审批</button>${editPending}<button class="mini delete" onclick="withdrawPendingChange(${index})">撤回</button>` : '';
-    return `<tr${rowClass}><td class="select-col"><input class="row-select" type="checkbox" data-index="${index}" title="选择"${disabled}></td><td>${pendingStatus(r)}</td><td><div class="row-actions">${pendingAction}<button class="mini" onclick="openEdit('${encoded}')"${disabled}>修改</button><button class="mini delete" onclick="removeRow('${encoded}')"${disabled}>删除</button></div></td>${cols.map(h => `<td class="cell-text">${esc(r[h])}</td>`).join('')}</tr>`;
+    const attachAction = state.entity === 'servers' ? attachmentButton(r) : '';
+    return `<tr${rowClass}><td class="select-col"><input class="row-select" type="checkbox" data-index="${index}" title="选择"${disabled}></td><td>${pendingStatus(r)}</td><td><div class="row-actions">${pendingAction}<button class="mini" onclick="openEdit('${encoded}')"${disabled}>修改</button><button class="mini delete" onclick="removeRow('${encoded}')"${disabled}>删除</button>${attachAction}</div></td>${cols.map(h => `<td class="cell-text">${esc(r[h])}</td>`).join('')}</tr>`;
   }).join('') : '<tr><td class="empty" colspan="99">暂无正式数据</td></tr>';
   $('#selectAllRows').onchange = e => {
     $$('.row-select:not(:disabled)').forEach(input => input.checked = e.target.checked);
@@ -1142,6 +1144,7 @@ function renderRackReviewList() {
   $('#reviewList').innerHTML = rows.length ? rows.map(rackReviewCard).join('') : '<div class="card empty">当前没有记录</div>';
   hydrateRackApprovalForms();
   bindRackReviewExpand();
+  hydrateAttachmentPanels($('#reviewList'));
   $$('.rack-select').forEach(input => input.onchange = updateChangeSelection);
   updateChangeSelection();
   if ($('#pendingBadge') && state.status === 'pending') $('#pendingBadge').textContent = rows.length;
@@ -1175,6 +1178,7 @@ async function loadRackReviewChanges() {
   state.rackRequests = d.requests;
   await loadCustomerOptions();
   await loadRackApprovalOptions();
+  await loadAttachmentsFor(d.requests.map(item => item['序列号']));
   renderRackReviewList();
 }
 
@@ -1476,7 +1480,7 @@ function rackReviewCard(item) {
   const customer = item['客户名称'] || item['客户id'] || '';
   const expanded = state.rackReviewExpanded.includes(item.id);
   const head = `<div class="review-top rack-request-head" data-rack-expand-id="${esc(item.id)}" title="点击展开/收起"><span class="tag">${esc(item.request_type)}</span><strong>${esc(item['序列号'])} · ${esc(item['所在机房'] || '未指定机房')}${customer ? ' · ' + esc(customer) : ''}</strong><span class="rack-caret">${expanded ? '▾' : '▸'}</span></div>`;
-  const body = `<div class="rack-request-body"${expanded ? '' : ' hidden'}><div class="diff compact"><div class="diff-box"><b>原请求补充信息</b>${rackRequestDetails(item)}</div></div>${rackApprovalForm(item)}${item.reject_reason ? `<p class="muted">驳回原因：${esc(item.reject_reason)}</p>` : ''}${actions}</div>`;
+  const body = `<div class="rack-request-body"${expanded ? '' : ' hidden'}><div class="diff compact"><div class="diff-box"><b>原请求补充信息</b>${rackRequestDetails(item)}</div></div>${attachmentPanelHtml(item['序列号'], item.id, 'rackReview')}${rackApprovalForm(item)}${item.reject_reason ? `<p class="muted">驳回原因：${esc(item.reject_reason)}</p>` : ''}${actions}</div>`;
   return `<article class="review-card rack-request-card">${picker}${head}${body}</article>`;
 }
 
@@ -1491,7 +1495,7 @@ function rackSubmitterCard(item) {
   const customer = item['客户名称'] || item['客户id'] || '';
   const expanded = state.rackRequestExpanded.includes(item.id);
   const head = `<div class="review-top rack-request-head" data-rack-expand-id="${esc(item.id)}" title="点击展开/收起"><span class="tag">${esc(item.request_type)}</span><strong>${esc(item['序列号'])} · ${esc(item['所在机房'] || '未指定机房')}${customer ? ' · ' + esc(customer) : ''}</strong><span class="review-time">${esc(item.submitted_at)}</span><span class="rack-caret">${expanded ? '▾' : '▸'}</span></div>`;
-  const body = `<div class="rack-request-body"${expanded ? '' : ' hidden'}><div class="diff"><div class="diff-box"><b>请求内容</b>${pretty(item.request_data)}</div></div>${item.reject_reason ? `<p class="muted">驳回原因：${esc(item.reject_reason)}</p>` : ''}${actions}</div>`;
+  const body = `<div class="rack-request-body"${expanded ? '' : ' hidden'}><div class="diff"><div class="diff-box"><b>请求内容</b>${pretty(item.request_data)}</div></div>${attachmentPanelHtml(item['序列号'], item.id, 'rackRequest')}${item.reject_reason ? `<p class="muted">驳回原因：${esc(item.reject_reason)}</p>` : ''}${actions}</div>`;
   return `<article class="review-card rack-request-card">${head}${body}</article>`;
 }
 
@@ -1561,6 +1565,7 @@ function renderRackRequestList() {
   const rows = filteredRackRequests();
   $('#rackRequestList').innerHTML = rows.length ? rows.map(rackSubmitterCard).join('') : `<div class="card empty">${rackRequestEmptyText()}</div>`;
   bindRackRequestExpand();
+  hydrateAttachmentPanels($('#rackRequestList'));
 }
 
 function updateRackRequestStatusTabs() {
@@ -1584,6 +1589,7 @@ async function loadRackRequests() {
   updateRackRequestStatusTabs();
   const d = await api(`/api/rack-requests?status=${state.rackRequestStatus}&scope=submitted`);
   state.rackRequests = d.requests;
+  await loadAttachmentsFor(d.requests.map(item => item['序列号']));
   renderRackRequestList();
 }
 
@@ -1609,12 +1615,26 @@ async function autofillRackOffFields() {
 
 async function submitRackRequest(event) {
   event.preventDefault();
+  const fileInput = $('#rackRequestFiles');
+  const files = [...(fileInput?.files || [])];
   try {
     const row = Object.fromEntries(new FormData(event.target));
     const url = state.rackEditing ? `/api/rack-requests/${state.rackEditing}/update` : '/api/rack-requests';
     const body = state.rackEditing ? { request_data: row } : row;
     const d = await api(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
     toast(d.message);
+    // 请求建立后再上传资料：此时序列号在该用户可见范围内，资料随序列号长期留存
+    const serial = String(row['序列号'] || '').trim();
+    if (files.length && serial) {
+      const requestId = d.request_id || state.rackEditing || '';
+      try {
+        const up = await uploadAttachmentFiles(serial, requestId, files, 'rack-request');
+        toast(`${d.message}，${up.message}`);
+      } catch (e) {
+        toast(`${d.message}，但资料上传失败：${e.message}`, true);
+      }
+      if (fileInput) fileInput.value = '';
+    }
     resetRackRequestForm();
     state.rackRequestStatus = 'pending';
     state.rackRequestFilters = [];
@@ -1701,6 +1721,192 @@ async function reviewRackRequest(id, action) {
   } catch (e) {
     toast(e.message, true);
   }
+}
+
+// ---------------------------------------------------------------- 服务器资料（附件）
+// 资料按「序列号」归属：上下架请求 / 机位IP分配 / 具体实施 / 服务器信息表看到的是同一份档案。
+// 资料不进 Excel 导出，只在这里查看、上传、重命名、删除。
+
+function canUploadAttachments() {
+  return isAdmin() || hasCapability('submit_rack_request') || hasCapability('review_rack_requests');
+}
+
+function attachmentSizeText(size) {
+  const bytes = Number(size || 0);
+  if (bytes >= 1024 * 1024) return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
+  if (bytes >= 1024) return `${Math.round(bytes / 1024)} KB`;
+  return `${bytes} B`;
+}
+
+function attachmentButton(row) {
+  const serial = String(row['序列号'] || '');
+  if (!serial) return '';
+  const count = state.attachmentCounts[serial] || 0;
+  const label = count ? `资料 ${count}` : '资料';
+  // 单引号 encodeURIComponent 不会转义，这里补上，避免序列号里的引号破坏内联 onclick
+  const encoded = encodeURIComponent(serial).replace(/'/g, '%27');
+  return `<button class="mini attach" onclick="openAttachments('${encoded}')" title="查看 / 上传服务器资料">${esc(label)}</button>`;
+}
+
+function attachmentPanelHtml(serial, requestId = '', reload = 'rackReview') {
+  const key = String(serial || '').trim();
+  if (!key) {
+    return '<div class="attachment-block"><div class="attachment-head"><b>附件资料</b></div><p class="attachment-empty">该请求没有序列号，暂无资料</p></div>';
+  }
+  const items = state.attachmentMap[key] || [];
+  const upload = canUploadAttachments()
+    ? `<label class="btn ghost attachment-upload">⇧ 上传资料<input type="file" multiple data-attachment-upload hidden></label>`
+    : '';
+  const list = items.length
+    ? items.map(item => `<li class="attachment-item">
+        <a class="attachment-name" href="/api/attachments/${esc(item.id)}/download" title="下载 ${esc(item.filename)}">${esc(item.filename)}</a>
+        <span class="attachment-meta">${attachmentSizeText(item.size)} · ${esc(item.uploader)} · ${esc(item.uploaded_at)}</span>
+        ${item.can_manage ? `<span class="attachment-ops"><button class="mini" type="button" data-attachment-rename="${esc(item.id)}" data-filename="${esc(item.filename)}">重命名</button><button class="mini delete" type="button" data-attachment-delete="${esc(item.id)}">删除</button></span>` : ''}
+      </li>`).join('')
+    : '<li class="attachment-empty">暂无资料</li>';
+  return `<div class="attachment-block" data-attachment-block data-serial="${esc(key)}" data-request-id="${esc(requestId || '')}" data-reload="${esc(reload)}">
+    <div class="attachment-head"><b>附件资料</b><span class="muted">${items.length} 个</span>${upload}</div>
+    <ul class="attachment-list">${list}</ul>
+  </div>`;
+}
+
+function hydrateAttachmentPanels(root = document) {
+  const scope = root || document;
+  scope.querySelectorAll('[data-attachment-block]').forEach(block => {
+    const serial = block.dataset.serial || '';
+    const requestId = block.dataset.requestId || '';
+    const reload = block.dataset.reload || 'rackReview';
+    const input = block.querySelector('[data-attachment-upload]');
+    if (input) {
+      input.onchange = async () => {
+        const files = [...(input.files || [])];
+        if (!files.length) return;
+        try {
+          const d = await uploadAttachmentFiles(serial, requestId, files, reload);
+          toast(d.message);
+          await refreshAttachmentView(reload, serial);
+        } catch (e) {
+          toast(e.message, true);
+        } finally {
+          input.value = '';
+        }
+      };
+    }
+    block.querySelectorAll('[data-attachment-rename]').forEach(btn => {
+      btn.onclick = async () => {
+        const next = prompt('新的资料名称（含扩展名）：', btn.dataset.filename || '');
+        if (next === null) return;
+        const filename = String(next).trim();
+        if (!filename) return;
+        try {
+          const d = await api(`/api/attachments/${btn.dataset.attachmentRename}/rename`, {
+            method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ filename }),
+          });
+          toast(d.message);
+          await refreshAttachmentView(reload, serial);
+        } catch (e) {
+          toast(e.message, true);
+        }
+      };
+    });
+    block.querySelectorAll('[data-attachment-delete]').forEach(btn => {
+      btn.onclick = async () => {
+        if (!confirm('确定删除该资料？删除后不可恢复。')) return;
+        try {
+          const d = await api(`/api/attachments/${btn.dataset.attachmentDelete}/delete`, { method: 'POST' });
+          toast(d.message);
+          await refreshAttachmentView(reload, serial);
+        } catch (e) {
+          toast(e.message, true);
+        }
+      };
+    });
+  });
+}
+
+async function uploadAttachmentFiles(serial, requestId, files, source) {
+  const body = new FormData();
+  body.append('serial', serial);
+  if (requestId) body.append('request_id', requestId);
+  if (source) body.append('source', source);
+  files.forEach(file => body.append('files', file));
+  return api('/api/attachments', { method: 'POST', body });
+}
+
+async function loadAttachmentsFor(serials) {
+  const list = [...new Set((serials || []).map(item => String(item || '').trim()).filter(Boolean))];
+  if (!list.length) return;
+  try {
+    const d = await api(`/api/attachments?serials=${encodeURIComponent(list.join(','))}`);
+    const map = {};
+    list.forEach(serial => { map[serial] = []; });
+    (d.items || []).forEach(item => {
+      const key = item.serial_number;
+      (map[key] = map[key] || []).push(item);
+    });
+    Object.assign(state.attachmentMap, map);
+  } catch (e) {
+    // 资料加载失败不应阻断主列表渲染
+    list.forEach(serial => { state.attachmentMap[serial] = state.attachmentMap[serial] || []; });
+  }
+}
+
+async function loadAttachmentCounts() {
+  try {
+    const d = await api('/api/attachments/summary');
+    state.attachmentCounts = d.counts || {};
+  } catch (e) {
+    state.attachmentCounts = {};
+  }
+}
+
+async function refreshAttachmentView(reload, serial) {
+  if (reload === 'rackReview') {
+    await loadRackReviewChanges();
+    return;
+  }
+  if (reload === 'rackRequest' || reload === 'rack-request') {
+    await loadRackRequests();
+    return;
+  }
+  // 服务器信息表 / 资料弹窗：刷新当前序列号的资料与徽标
+  await loadAttachmentsFor([serial]);
+  await loadAttachmentCounts();
+  if (state.meta && state.entity === 'servers') renderTable();
+  if (state.attachmentModalSerial === serial) renderAttachmentModal();
+}
+
+function renderAttachmentModal() {
+  const serial = state.attachmentModalSerial;
+  const title = $('#attachmentModalTitle');
+  if (title) title.textContent = `服务器资料 · ${serial || '-'}`;
+  const body = $('#attachmentModalBody');
+  if (!body) return;
+  body.innerHTML = attachmentPanelHtml(serial, '', 'server');
+  hydrateAttachmentPanels(body);
+}
+
+async function openAttachmentModal(serial) {
+  state.attachmentModalSerial = String(serial || '');
+  await loadAttachmentsFor([state.attachmentModalSerial]);
+  renderAttachmentModal();
+  const modal = $('#attachmentModal');
+  if (modal) modal.classList.add('open');
+}
+
+function closeAttachmentModal() {
+  const modal = $('#attachmentModal');
+  if (modal) modal.classList.remove('open');
+  state.attachmentModalSerial = '';
+}
+
+window.openAttachments = encodedSerial => openAttachmentModal(decodeURIComponent(encodedSerial));
+
+if ($('#closeAttachmentModal')) $('#closeAttachmentModal').onclick = closeAttachmentModal;
+if ($('#attachmentModal')) {
+  $('#attachmentModal').onclick = event => {
+    if (event.target.id === 'attachmentModal') closeAttachmentModal();
+  };
 }
 
 async function loadSettings() {
