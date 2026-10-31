@@ -45,6 +45,15 @@ FIELD_ALIASES = {
 IP_FIELDS = ("管理ip", "交易ip", "带外ip")
 IP_RANGE_FIELDS = {"管理ip": "管理ip网段", "交易ip": "交易ip网段", "带外ip": "带外ip网段"}
 
+# 多值标签字段：单元格里存 "A, B" 形式文本（Excel 可读），表单里按标签多选。
+# 每个字段维护独立的候选池（field_options 表），池只能由管理人员维护。
+MULTI_VALUE_FIELDS = {"servers": ("接入行情", "接入柜台")}
+TAG_SEPARATOR_PATTERN = re.compile(r"[,，、;；\r\n]+")
+TAG_JOINER = ", "
+TAG_MAX_LENGTH = 40      # 单个标签最大长度
+TAG_MAX_COUNT = 20       # 单条记录单字段最多几个标签
+TAG_MAX_OPTIONS = 200    # 单个字段候选池上限
+
 RACK_REQUEST_HEADERS = ["序列号", "品牌", "型号", "CPU型号", "网卡", "服务器成本(万)", "防火墙白名单", "资源申请编号", "是否液冷", "是否上架", "是否重装系统", "初始密码", "上下架需求", "备注", "客户id", "客户名称", "所在机房"]
 RACK_REQUEST_META = {"label": "上下架请求", "sheet": "上下架请求", "headers": RACK_REQUEST_HEADERS}
 # 导出时在请求字段基础上追加机位/IP 分配结果，便于在机位IP分配/具体实施阶段留档
@@ -85,6 +94,48 @@ def normalize_entity(entity):
     return entity
 
 
+def multi_value_fields(entity):
+    """该实体的多值标签字段（无则返回空元组）。"""
+    return MULTI_VALUE_FIELDS.get(normalize_entity(entity), ())
+
+
+def is_multi_value_field(entity, field):
+    return field in multi_value_fields(entity)
+
+
+def normalize_tag(value):
+    """单个标签归一：去首尾空白，内部连续空白折叠成一个空格。"""
+    return re.sub(r"\s+", " ", clean_value(value))
+
+
+def split_tags(value):
+    """把单元格文本 / 列表拆成标签列表：去空、去重（保留首次出现顺序）。
+
+    同时接受 list（API/MCP 传数组）和字符串（Excel、表单）。
+    """
+    if isinstance(value, (list, tuple, set)):
+        raw = [normalize_tag(item) for item in value]
+    else:
+        raw = [normalize_tag(item) for item in TAG_SEPARATOR_PATTERN.split(clean_value(value))]
+    tags = []
+    for tag in raw:
+        if tag and tag not in tags:
+            tags.append(tag)
+    return tags
+
+
+def join_tags(values):
+    """标签列表拼成存库文本，统一用半角逗号 + 空格分隔。"""
+    return TAG_JOINER.join(split_tags(values))
+
+
+def normalize_field_value(entity, field, value):
+    """写库前的字段归一：多值字段统一分隔符，其余字段按原样 clean。"""
+    if is_multi_value_field(entity, field):
+        return join_tags(value)
+    return clean_value(value)
+
+
 def entity_meta(entity):
     return ENTITIES[normalize_entity(entity)]
 
@@ -97,7 +148,7 @@ def normalize_row(entity, row):
     for key, value in (row or {}).items():
         target = aliases.get(key, key)
         if target in normalized:
-            normalized[target] = clean_value(value)
+            normalized[target] = normalize_field_value(entity, target, value)
     return normalized
 
 

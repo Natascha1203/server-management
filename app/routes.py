@@ -1,15 +1,18 @@
 """HTTP 路由层：全部接口，只做参数解析、权限判断和 service 调用。"""
 from __future__ import annotations
 
+import hashlib
+import io
 import json
 import logging
+import zipfile
 from datetime import datetime
 from functools import wraps
 from pathlib import Path
 
-from flask import Blueprint, g, jsonify, redirect, render_template, request, send_file, session, url_for
+from flask import Blueprint, Response, g, jsonify, redirect, render_template, request, send_file, session, url_for
 
-from . import services, storage
+from . import mcp_package, services, skill_docs, storage
 from .config import legacy_role_name, role_code
 from .core import (
     ENTITIES,
@@ -174,6 +177,95 @@ def download_skill():
     )
 
 
+@bp.get("/api/mcp/download")
+@require_login
+def download_mcp_package():
+    """实时打包 mcp_server/ 目录，永远等于当前线上代码（不做预生成，避免发旧包）。"""
+    root = mcp_package.mcp_dir(storage.STATE["config"])
+    if not root.is_dir():
+        return jsonify({"error": "MCP 服务目录不存在：%s（可用 app.ini 的 mcp_dir 指定）" % root}), 404
+    try:
+        data, version = mcp_package.build_package(root)
+    except (OSError, zipfile.BadZipFile) as exc:
+        logger.warning("打包 MCP 失败：%s", exc)
+        return jsonify({"error": "打包 MCP 失败：%s" % exc}), 500
+    response = send_file(
+        io.BytesIO(data),
+        as_attachment=True,
+        download_name="server_management_mcp.zip",
+        mimetype="application/zip",
+    )
+    response.headers["X-MCP-Version"] = version
+    return response
+
+
+# ---------------------------------------------------------------- skill 文档分发
+# 三个只读端点，默认**免鉴权**：只暴露文档正文与字段名，不含 token、用户列表、
+# 任何业务数据。要收紧就在 app.ini 配 skill_docs_token，配了之后要求
+# X-Skill-Token 头（已登录用户仍然放行，方便页面内调试）。
+#
+# 它们的意义是让「agent 拿到的字段永远等于当前实现」：schema 由 core 运行时组装，
+# 没有任何缓存；给 ENTITIES 加一列，重启服务即可生效，MCP 与 skill 都不用改。
+
+def skill_docs_allowed():
+    expected = clean_value(storage.STATE["config"].get("skill_docs_token"))
+    if not expected:
+        return True
+    if clean_value(request.headers.get("X-Skill-Token")) == expected:
+        return True
+    return bool(current_user())
+
+
+@bp.get("/api/skill/manifest")
+def skill_manifest():
+    if not skill_docs_allowed():
+        return jsonify({"error": "skill 文档需要 X-Skill-Token 或登录后访问"}), 401
+    body = skill_docs.build_manifest()
+    resp = jsonify(body)
+    resp.headers["X-Skill-Version"] = body["version"]
+    resp.headers["Cache-Control"] = "no-cache"
+    return resp
+
+
+@bp.get("/api/skill/docs")
+def skill_document():
+    if not skill_docs_allowed():
+        return jsonify({"error": "skill 文档需要 X-Skill-Token 或登录后访问"}), 401
+    name = clean_value(request.args.get("name")) or skill_docs.DEFAULT_DOC
+    if not skill_docs._is_safe_doc_name(name):
+        return jsonify({"error": f"非法的文档名：{name}"}), 400
+    content, path = skill_docs.read_doc(name)
+    if content is None:
+        return jsonify({
+            "error": f"文档 {name} 不存在",
+            "available": skill_docs.available_docs(),
+        }), 404
+    etag = hashlib.sha256(content).hexdigest()
+    if request.if_none_match.contains(etag):
+        unchanged = Response(status=304)
+        unchanged.headers["ETag"] = f'"{etag}"'
+        unchanged.headers["X-Skill-Version"] = skill_docs.compute_version()
+        return unchanged
+    resp = Response(content, mimetype="text/markdown")
+    resp.headers["ETag"] = f'"{etag}"'
+    resp.headers["X-Skill-Version"] = skill_docs.compute_version()
+    resp.headers["X-Skill-Doc"] = path.name
+    resp.headers["X-Skill-Path"] = path.relative_to(skill_docs.base_dir()).as_posix()
+    resp.headers["Cache-Control"] = "no-cache"
+    return resp
+
+
+@bp.get("/api/skill/schema")
+def skill_schema():
+    if not skill_docs_allowed():
+        return jsonify({"error": "skill 文档需要 X-Skill-Token 或登录后访问"}), 401
+    body = skill_docs.build_schema()
+    resp = jsonify(body)
+    resp.headers["X-Skill-Version"] = skill_docs.compute_version(body)
+    resp.headers["Cache-Control"] = "no-cache"
+    return resp
+
+
 @bp.route("/login", methods=["GET", "POST"])
 def login_page():
     if request.method == "GET":
@@ -220,10 +312,30 @@ def me():
 @bp.get("/api/my-token")
 @require_login
 def my_token():
-    """返回当前登录用户自己的 API token；未配置时返回空串（前端据此提示联系管理员）。"""
+    """返回当前登录用户自己的 API token；未配置时返回空串（前端据此提供一键生成）。"""
     user = current_user()
     configured = storage.get_users().get(user["用户id"], {}) or {}
     return jsonify({"api_token": clean_value(configured.get("api_token", ""))})
+
+
+@bp.post("/api/my-token/regenerate")
+@require_login
+def regenerate_my_token():
+    """生成 / 重置当前用户自己的 API token，旧 token 立即失效。
+
+    只接受**页面登录态**（session）：token 本身不能用来换发新 token，
+    否则一枚泄露的 token 可以把主人挤掉。
+    """
+    user = current_user()
+    if not session.get("username"):
+        return jsonify({"error": "请先登录页面再生成 token，token 不能用于自我换发"}), 403
+    try:
+        token = storage.generate_user_api_token(user["用户id"])
+    except KeyError:
+        return jsonify({"error": "当前账号不在用户配置中，请联系管理员"}), 404
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    return jsonify({"api_token": token, "message": "Token 已生成，此前的 token 已立即失效"})
 
 
 @bp.get("/api/cabinet-options")
@@ -282,6 +394,75 @@ def customer_options():
         for row in records
         if row.get("客户id")
     ])
+
+
+# ==== 多值标签字段的候选池（接入行情 / 接入柜台）====
+# 读：能看该实体的人都能读（维护页/审核页要渲染标签）；
+# 写：只有管理人员能新建、改名、删除；其他人只能在已有标签里选。
+@bp.get("/api/field-options")
+@require_login
+def field_options_api():
+    entity = normalize_entity(request.args.get("entity") or "servers")
+    denied = ensure_entity_view_response(entity)
+    if denied:
+        return denied
+    return jsonify(services.field_options_payload(entity, include_usage=is_admin_user()))
+
+
+@bp.post("/api/field-options")
+@require_login
+def create_field_option_api():
+    if not is_admin_user():
+        return forbidden("仅管理人员可以新增字段标签")
+    body = request.get_json(silent=True) or {}
+    try:
+        value = services.create_field_option(
+            body.get("entity") or "servers", clean_value(body.get("field")), body.get("value"),
+            actor=current_user()["用户id"],
+        )
+    except (KeyError, ValueError) as exc:
+        return jsonify(error=str(exc)), 400
+    return jsonify(message=f"标签「{value}」已添加", value=value)
+
+
+@bp.patch("/api/field-options")
+@require_login
+def rename_field_option_api():
+    if not is_admin_user():
+        return forbidden("仅管理人员可以修改字段标签")
+    body = request.get_json(silent=True) or {}
+    try:
+        result = services.rename_field_option(
+            body.get("entity") or "servers", clean_value(body.get("field")),
+            body.get("value"), body.get("new_value"), actor=current_user()["用户id"],
+        )
+    except (KeyError, ValueError) as exc:
+        return jsonify(error=str(exc)), 400
+    parts = []
+    if result["records"]:
+        parts.append(f"{result['records']} 台服务器")
+    if result["pending"]:
+        parts.append(f"{result['pending']} 条待审批")
+    suffix = f"已同步刷新 {'、'.join(parts)}" if parts else "没有记录引用该标签"
+    return jsonify(message=f"标签已改名，{suffix}", **result)
+
+
+@bp.delete("/api/field-options")
+@require_login
+def delete_field_option_api():
+    if not is_admin_user():
+        return forbidden("仅管理人员可以删除字段标签")
+    body = request.get_json(silent=True) or {}
+    entity = body.get("entity") or request.args.get("entity") or "servers"
+    field = clean_value(body.get("field") or request.args.get("field"))
+    value = body.get("value") if "value" in body else request.args.get("value")
+    try:
+        tag = services.delete_field_option(entity, field, value, actor=current_user()["用户id"])
+    except services.FieldOptionInUse as exc:
+        return jsonify(error=str(exc)), 409
+    except (KeyError, ValueError) as exc:
+        return jsonify(error=str(exc)), 400
+    return jsonify(message=f"标签「{tag}」已删除", value=tag)
 
 
 @bp.post("/api/<entity>/search")
@@ -866,6 +1047,15 @@ def reset_flow_state_api():
     return jsonify(message="流程状态已重置", summary=summary)
 
 
+def _system_users_payload(users):
+    """用户配置对外表示：不下发 api_token。
+
+    token 属于凭据，只能由本人在「🔑 获取 Token」入口查看/生成，
+    管理员编辑用户表既看不到也改不了别人的 token。
+    """
+    return [{key: value for key, value in dict(user).items() if key != "api_token"} for user in users]
+
+
 @bp.route("/api/system-users", methods=["GET", "PUT"])
 @require_login
 def system_users_api():
@@ -873,13 +1063,13 @@ def system_users_api():
     if "manage_settings" not in capabilities_for(user):
         return forbidden()
     if request.method == "GET":
-        return jsonify(users=storage.system_users_list())
+        return jsonify(users=_system_users_payload(storage.system_users_list()))
     body = request.get_json(silent=True) or {}
     try:
         users = storage.save_system_users(body.get("users"))
     except ValueError as exc:
         return jsonify(error=str(exc)), 400
-    return jsonify(message="用户配置已保存", users=users)
+    return jsonify(message="用户配置已保存", users=_system_users_payload(users))
 
 
 @bp.route("/api/rack-requests", methods=["GET", "POST"])

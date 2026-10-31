@@ -130,3 +130,41 @@ mark{background:#ffe9a8;color:inherit;padding:0 2px;border-radius:3px}
 .modal-panel.attachment-modal-panel{width:min(680px,96vw)}
 .modal-panel.attachment-modal-panel .attachment-block{margin-top:0}
 @media(max-width:900px){.attachment-item{flex-wrap:wrap;gap:6px}.attachment-name{max-width:100%}.attachment-meta{flex:1 1 100%}}
+
+
+/* ==== 多值标签字段（接入行情 / 接入柜台）==== */
+.tag-field{position:relative;display:flex;flex-wrap:wrap;align-items:center;gap:6px;min-height:42px;border:1px solid #d9e2e8;border-radius:8px;background:#fff;padding:5px 8px;cursor:text}
+.tag-field:focus-within{border-color:#28a99b;box-shadow:0 0 0 3px rgba(40,169,155,.1)}
+.tag-field.readonly{background:#eef3f6;cursor:default}
+.tag-field .tag-list{display:contents}
+.tag-field .tag-chip{display:inline-flex;align-items:center;gap:4px;background:#eef7f6;border:1px solid #cbe6e1;color:#137f74;border-radius:14px;font-size:12px;line-height:1.5;padding:2px 8px;max-width:100%;word-break:break-all}
+.tag-field .tag-x{border:0;background:transparent;color:#5c8f89;font-size:13px;line-height:1;cursor:pointer;padding:0 1px;border-radius:50%}
+.tag-field .tag-x:hover{background:#d7ece8;color:#0d5f57}
+.tag-field .tag-input{flex:1 1 90px;min-width:80px;border:0;outline:none;background:transparent;font:inherit;font-size:13px;padding:4px 2px;color:var(--text)}
+.tag-field .tag-menu{position:absolute;top:calc(100% + 4px);left:0;right:0;z-index:46;max-height:240px;overflow:auto;display:flex;flex-direction:column;gap:1px;background:#fff;border:1px solid var(--line);border-radius:8px;box-shadow:var(--shadow);padding:4px}
+.tag-field .tag-menu[hidden]{display:none}
+.tag-field .tag-option{border:0;background:transparent;text-align:left;font-size:13px;line-height:1.4;padding:8px 10px;border-radius:6px;cursor:pointer;color:var(--text)}
+.tag-field .tag-option:hover{background:#eef7f6;color:#137f74}
+.tag-field .tag-option.tag-create{color:#b26a00;font-weight:600}
+.tag-field .tag-empty{padding:9px 10px;font-size:12px;color:var(--muted)}
+.cell-tags{display:inline-flex;flex-wrap:wrap;gap:4px}
+.cell-tags .tag{display:inline-block;background:#eef7f6;border:1px solid #cbe6e1;color:#137f74;border-radius:12px;font-size:11px;line-height:1.6;padding:0 7px;white-space:nowrap}
+
+/* ==== 设置页：字段标签集中管理 ==== */
+.tag-admin-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:14px;padding:14px 0 0}
+.tag-admin-panel{border:1px solid #e4e9ed;border-radius:10px;background:#f9fbfc;padding:12px 14px}
+.tag-admin-head{display:flex;align-items:baseline;gap:10px;margin-bottom:10px}
+.tag-admin-head b{color:#17344b;font-size:13px}
+.tag-admin-list{list-style:none;margin:0;padding:0;display:flex;flex-direction:column;gap:6px;max-height:260px;overflow:auto}
+.tag-admin-row{display:flex;align-items:center;gap:8px;flex-wrap:wrap;font-size:12px}
+.tag-admin-row .tag-chip{background:#eef7f6;border:1px solid #cbe6e1;color:#137f74;border-radius:14px;padding:1px 8px;line-height:1.6}
+.tag-src{color:#8a99a5;font-size:10px;margin-left:4px}
+.tag-admin-usage{margin-left:auto;color:#526671}
+.tag-admin-actions{display:flex;gap:4px}
+.tag-admin-add{display:flex;gap:8px;margin-top:10px}
+.tag-admin-add input{flex:1;min-width:0;border:1px solid #d9e2e8;border-radius:8px;padding:7px 9px;font-size:12px;outline:none}
+.tag-admin-add input:focus{border-color:#28a99b;box-shadow:0 0 0 3px rgba(40,169,155,.1)}
+
+/* 表格里的多值标签允许换行（其他单元格仍单行省略） */
+#dataBody td.cell-tags-cell{white-space:normal;max-width:300px}
+.cell-tags{display:inline-flex;flex-wrap:wrap;gap:4px;max-height:76px;overflow:hidden}

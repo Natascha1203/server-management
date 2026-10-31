@@ -19,15 +19,23 @@ from .core import (
     RACK_REQUEST_HEADERS,
     RACK_REQUEST_EXPORT_HEADERS,
     RACK_REQUEST_META,
+    TAG_MAX_COUNT,
+    TAG_MAX_LENGTH,
+    TAG_MAX_OPTIONS,
+    TAG_SEPARATOR_PATTERN,
     capabilities_for,
     clean_value,
     date_text,
     entity_meta,
     filter_records_for_user,
     initial_rack_request_stage,
+    is_multi_value_field,
+    join_tags,
+    multi_value_fields,
     normalize_entity,
     normalize_rack_request_header,
     normalize_row,
+    normalize_tag,
     now_text,
     parse_filters,
     parse_json_dict,
@@ -35,6 +43,7 @@ from .core import (
     positions,
     record_key,
     sort_records,
+    split_tags,
     summarize_record,
     today_text,
     is_valid_ipv4_or_cidr,
@@ -457,6 +466,14 @@ def validate_record(entity, row, existing=None, exclude_record_key=None, allow_o
                     errors.append(f"所属机位 {slot} 已被服务器 {taken[slot]} 占用")
                     break
         errors.extend(same_kind_ip_conflict_errors(normalized))
+    for field in multi_value_fields(entity):
+        tags = split_tags(normalized.get(field))
+        if len(tags) > TAG_MAX_COUNT:
+            errors.append(f"{field}最多选 {TAG_MAX_COUNT} 个标签（当前 {len(tags)} 个）")
+        for tag in tags:
+            if len(tag) > TAG_MAX_LENGTH:
+                errors.append(f"{field}的标签「{tag[:12]}…」超过 {TAG_MAX_LENGTH} 字")
+                break
     if existing is not None:
         key = record_key(meta, normalized)
         if any(record_key(meta, x) == key for x in existing):
@@ -466,6 +483,242 @@ def validate_record(entity, row, existing=None, exclude_record_key=None, allow_o
 
 def duplicate_key_exists(meta, records, key, exclude_key=""):
     return any(record_key(meta, item) == key and record_key(meta, item) != exclude_key for item in records)
+
+
+class FieldOptionInUse(ValueError):
+    """标签仍被记录引用，不能删除（只能改名）。"""
+
+
+def _check_tag_field(entity, field):
+    entity = normalize_entity(entity)
+    if not is_multi_value_field(entity, field):
+        raise ValueError(f"{field} 不是多值标签字段；可用：{'、'.join(multi_value_fields(entity)) or '无'}")
+    return entity
+
+
+def _validated_new_tag(value):
+    """新建/改名时的标签校验：必须是单个标签，不能带分隔符。"""
+    tag = normalize_tag(value)
+    if not tag:
+        raise ValueError("标签不能为空")
+    if TAG_SEPARATOR_PATTERN.search(clean_value(value)):
+        raise ValueError("标签不能包含逗号、顿号或分号（它们是分隔符）")
+    if len(tag) > TAG_MAX_LENGTH:
+        raise ValueError(f"标签最长 {TAG_MAX_LENGTH} 个字（当前 {len(tag)} 个）")
+    return tag
+
+
+def field_options_list(entity, field):
+    entity = _check_tag_field(entity, field)
+    with db() as conn:
+        rows = conn.execute(
+            "SELECT * FROM field_options WHERE entity=? AND field=? ORDER BY id", (entity, field)
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def field_options_map(entity):
+    entity = normalize_entity(entity)
+    result = {field: [] for field in multi_value_fields(entity)}
+    if not result:
+        return result
+    with db() as conn:
+        rows = conn.execute(
+            "SELECT * FROM field_options WHERE entity=? ORDER BY id", (entity,)
+        ).fetchall()
+    for row in rows:
+        if row["field"] in result:
+            result[row["field"]].append(dict(row))
+    return result
+
+
+def tag_usage(entity, field, value, records=None):
+    """统计某标签被多少条正式记录 / 待审批变更使用。"""
+    entity = _check_tag_field(entity, field)
+    rows = records if records is not None else read_records(entity)
+    official = sum(1 for row in rows if value in split_tags(row.get(field)))
+    pending = 0
+    with db() as conn:
+        changes = conn.execute(
+            "SELECT new_data FROM changes WHERE entity=? AND status='pending'", (entity,)
+        ).fetchall()
+    for change in changes:
+        if value in split_tags(parse_json_dict(change["new_data"]).get(field)):
+            pending += 1
+    return {"official": official, "pending": pending}
+
+
+def absorb_field_options(entity, records, actor="", conn=None):
+    """把记录里已经出现、但候选池里没有的标签自动收进池（来源标记 data）。
+
+    Excel 手工改值、历史导入、API 直接写入都会走到这里，保证池不会和数据脱节。
+    返回新收纳的条数。
+    """
+    entity = normalize_entity(entity)
+    fields = multi_value_fields(entity)
+    if not fields:
+        return 0
+    seen = []
+    for row in records:
+        for field in fields:
+            for tag in split_tags(row.get(field)):
+                if (field, tag) not in seen:
+                    seen.append((field, tag))
+    if not seen:
+        return 0
+    if conn is None:
+        # 独立连接时必须走 with，否则 close 前不会提交（sqlite3 隐式事务会回滚）
+        with db() as owned:
+            return _absorb_rows(owned, entity, seen, actor)
+    return _absorb_rows(conn, entity, seen, actor)
+
+
+def _absorb_rows(conn, entity, seen, actor):
+    added = 0
+    stamp = now_text()
+    for field, tag in seen:
+        cursor = conn.execute(
+            "INSERT OR IGNORE INTO field_options (entity,field,value,source,created_at,created_by)"
+            " VALUES (?,?,?,?,?,?)",
+            (entity, field, tag, "data", stamp, actor),
+        )
+        added += cursor.rowcount or 0
+    return added
+
+
+def field_options_payload(entity, include_usage=False):
+    """候选池对外载荷：字段 → 标签列表（可选带使用次数）。顺带把池外值收纳进池。"""
+    entity = normalize_entity(entity)
+    fields = list(multi_value_fields(entity))
+    if not fields:
+        return {"entity": entity, "fields": [], "options": {}}
+    records = read_records(entity)
+    absorb_field_options(entity, records)
+    usage = {}
+    if include_usage:
+        with db() as conn:
+            pending_rows = conn.execute(
+                "SELECT new_data FROM changes WHERE entity=? AND status='pending'", (entity,)
+            ).fetchall()
+        for field in fields:
+            counts = {}
+            for row in records:
+                for tag in split_tags(row.get(field)):
+                    counts.setdefault(tag, {"official": 0, "pending": 0})["official"] += 1
+            for row in pending_rows:
+                for tag in split_tags(parse_json_dict(row["new_data"]).get(field)):
+                    counts.setdefault(tag, {"official": 0, "pending": 0})["pending"] += 1
+            usage[field] = counts
+    options = {}
+    for field in fields:
+        items = []
+        for option in field_options_list(entity, field):
+            item = {"value": option["value"], "source": option["source"]}
+            if include_usage:
+                item["usage"] = usage.get(field, {}).get(option["value"], {"official": 0, "pending": 0})
+            items.append(item)
+        options[field] = items
+    return {"entity": entity, "fields": fields, "options": options}
+
+
+def create_field_option(entity, field, value, actor=""):
+    entity = _check_tag_field(entity, field)
+    tag = _validated_new_tag(value)
+    with db() as conn:
+        exists = conn.execute(
+            "SELECT 1 FROM field_options WHERE entity=? AND field=? AND value=?", (entity, field, tag)
+        ).fetchone()
+        if exists:
+            raise ValueError(f"标签「{tag}」已存在")
+        total = conn.execute(
+            "SELECT COUNT(*) FROM field_options WHERE entity=? AND field=?", (entity, field)
+        ).fetchone()[0]
+        if total >= TAG_MAX_OPTIONS:
+            raise ValueError(f"{field}候选标签已达上限 {TAG_MAX_OPTIONS} 个")
+        conn.execute(
+            "INSERT INTO field_options (entity,field,value,source,created_at,created_by) VALUES (?,?,?,?,?,?)",
+            (entity, field, tag, "manual", now_text(), actor),
+        )
+    return tag
+
+
+def _rewrite_pending_tag(entity, field, old_tag, new_tag, conn):
+    """把待审批变更 new_data 里的旧标签换掉，避免改名后审批一通过又把旧值写回去。"""
+    rows = conn.execute(
+        "SELECT id,new_data FROM changes WHERE entity=? AND status='pending'", (entity,)
+    ).fetchall()
+    changed = 0
+    for row in rows:
+        data = parse_json_dict(row["new_data"])
+        tags = split_tags(data.get(field))
+        if old_tag not in tags:
+            continue
+        data[field] = join_tags([new_tag if tag == old_tag else tag for tag in tags])
+        conn.execute(
+            "UPDATE changes SET new_data=? WHERE id=?",
+            (json.dumps(data, ensure_ascii=False), row["id"]),
+        )
+        changed += 1
+    return changed
+
+
+def rename_field_option(entity, field, value, new_value, actor=""):
+    """标签改名：刷新候选池，并级联刷新正式记录 + 待审批变更里的旧值。
+
+    返回 {records, pending} 两处被刷新的条数。
+    """
+    entity = _check_tag_field(entity, field)
+    old_tag = normalize_tag(value)
+    new_tag = _validated_new_tag(new_value)
+    if old_tag == new_tag:
+        return {"records": 0, "pending": 0}
+    records = read_records(entity)
+    # 池外值（直接改 Excel 产生）先收进池，否则会出现「记录在用、池里查不到」
+    absorb_field_options(entity, records)
+    with db() as conn:
+        row = conn.execute(
+            "SELECT id FROM field_options WHERE entity=? AND field=? AND value=?", (entity, field, old_tag)
+        ).fetchone()
+        if not row:
+            raise ValueError(f"标签「{old_tag}」不存在")
+        duplicated = conn.execute(
+            "SELECT 1 FROM field_options WHERE entity=? AND field=? AND value=?", (entity, field, new_tag)
+        ).fetchone()
+        if duplicated:
+            raise ValueError(f"标签「{new_tag}」已存在，不能重名")
+        conn.execute(
+            "UPDATE field_options SET value=?, updated_at=?, updated_by=? WHERE id=?",
+            (new_tag, now_text(), actor, row["id"]),
+        )
+    touched = 0
+    for record in records:
+        tags = split_tags(record.get(field))
+        if old_tag in tags:
+            record[field] = join_tags([new_tag if tag == old_tag else tag for tag in tags])
+            touched += 1
+    if touched:
+        storage.write_records(entity, records)
+    with db() as conn:
+        pending = _rewrite_pending_tag(entity, field, old_tag, new_tag, conn)
+    return {"records": touched, "pending": pending}
+
+
+def delete_field_option(entity, field, value, actor=""):
+    """删除标签：只要还有正式记录或待审批变更在用它，就拒绝（只能改名）。"""
+    entity = _check_tag_field(entity, field)
+    tag = normalize_tag(value)
+    usage = tag_usage(entity, field, tag)
+    if usage["official"] or usage["pending"]:
+        raise FieldOptionInUse(
+            f"标签「{tag}」仍有 {usage['official']} 台服务器、{usage['pending']} 条待审批在使用，只能改名，不能删除"
+        )
+    with db() as conn:
+        cursor = conn.execute(
+            "DELETE FROM field_options WHERE entity=? AND field=? AND value=?", (entity, field, tag)
+        )
+        if not cursor.rowcount:
+            raise ValueError(f"标签「{tag}」不存在")
+    return tag
 
 
 def update_pending_user_references(conn, old_user_id, new_user_id, new_user_name, exclude_change_id):
@@ -725,6 +978,8 @@ def approve_change(change, final_new_data=None, conn=None):
         else:
             records = [record for record in records if record_key(meta, record) != key]
     write_records(entity, records)
+    # 写库成功后把出现的新标签自动收进候选池（Excel 手工改、导入、API 写入都走这里）
+    absorb_field_options(entity, records, conn=conn)
     if conn and entity == "customers" and change["operation"] == "修改":
         cascade_customer_change(conn, change["record_key"], new_key, new.get("名称", ""), change["id"])
     return new

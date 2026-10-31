@@ -119,6 +119,14 @@ def load_config(config_path=None):
         if not skill_zip_path.is_absolute():
             skill_zip_path = base_dir / skill_zip_path
 
+    # MCP 服务目录（页面「下载 MCP」按钮实时打包的来源）。留空 = 项目根下 mcp_server/
+    mcp_dir_text = parser.get("app", "mcp_dir", fallback="").strip() or os.environ.get("SM_MCP_DIR", "")
+    mcp_dir_path = None
+    if mcp_dir_text:
+        mcp_dir_path = Path(mcp_dir_text)
+        if not mcp_dir_path.is_absolute():
+            mcp_dir_path = base_dir / mcp_dir_path
+
     return {
         "base_dir": base_dir,
         "data_dir": data_dir,
@@ -133,5 +141,10 @@ def load_config(config_path=None):
         "notify_webhook_url": notify_webhook_url,
         "notify_message_type": parser.get("app", "notify_message_type", fallback="markdown").strip() or "markdown",
         "skill_zip_path": skill_zip_path,
+        "mcp_dir": mcp_dir_path,
+        # /api/skill/{manifest,docs,schema} 可选访问口令：留空即公开只读（默认），
+        # 配了就要求 X-Skill-Token 头（已登录用户不受影响）。
+        "skill_docs_token": parser.get("app", "skill_docs_token", fallback="").strip()
+        or os.environ.get("SM_SKILL_DOCS_TOKEN", ""),
         "users": users,
     }

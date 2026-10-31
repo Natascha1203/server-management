@@ -13,6 +13,7 @@ import json
 import logging
 import os
 import re
+import secrets
 import shutil
 import sqlite3
 import subprocess
@@ -138,6 +139,20 @@ ATTACHMENTS_SCHEMA = """CREATE TABLE IF NOT EXISTS attachments (
     source TEXT NOT NULL DEFAULT ''
 )"""
 
+# 字段候选标签池（目前用于 servers 的「接入行情」「接入柜台」多选）。
+# 只存元数据，不参与 Excel 导出/版本快照；记录里仍保存 "A, B" 文本。
+FIELD_OPTIONS_SCHEMA = """CREATE TABLE IF NOT EXISTS field_options (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    entity TEXT NOT NULL,
+    field TEXT NOT NULL,
+    value TEXT NOT NULL,
+    source TEXT NOT NULL DEFAULT 'manual',
+    created_at TEXT NOT NULL,
+    created_by TEXT NOT NULL DEFAULT '',
+    updated_at TEXT NOT NULL DEFAULT '',
+    updated_by TEXT NOT NULL DEFAULT ''
+)"""
+
 # 文件名 / 目录名里不允许出现的字符（含 Windows 保留字符与控制字符）
 UNSAFE_NAME_PATTERN = re.compile(r'[\\/:*?"<>|\x00-\x1f]')
 ARCHIVE_NAME_MAX = 120
@@ -192,6 +207,14 @@ def ensure_attachments_schema(conn):
     # 早期版本可能没有这两列，补齐以免 SELECT 报错
     add_column_if_missing(conn, "attachments", "request_id", "request_id TEXT NOT NULL DEFAULT ''")
     add_column_if_missing(conn, "attachments", "source", "source TEXT NOT NULL DEFAULT ''")
+
+
+def ensure_field_options_schema(conn):
+    conn.execute(FIELD_OPTIONS_SCHEMA)
+    conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_field_options_unique ON field_options(entity, field, value)")
+    # 改名留痕列：早期建表可能没有，补齐即可（默认空串）
+    add_column_if_missing(conn, "field_options", "updated_at", "updated_at TEXT NOT NULL DEFAULT ''")
+    add_column_if_missing(conn, "field_options", "updated_by", "updated_by TEXT NOT NULL DEFAULT ''")
 
 
 def archive_root():
@@ -497,6 +520,7 @@ def init_storage():
         ensure_changes_schema(conn)
         ensure_rack_requests_schema(conn)
         ensure_attachments_schema(conn)
+        ensure_field_options_schema(conn)
         conn.execute(SETTINGS_SCHEMA)
         conn.execute("CREATE INDEX IF NOT EXISTS idx_changes_status ON changes(status)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_rack_requests_status ON rack_requests(status)")
@@ -626,13 +650,50 @@ def normalize_system_user(raw):
     return normalize_user(raw)
 
 
-def save_system_users(users):
+def save_system_users(users, keep_existing_tokens=True):
+    """保存用户配置。
+
+    keep_existing_tokens=True（默认，设置页整表保存走这条）：api_token **一律沿用磁盘原值**，
+    传入值被忽略——token 只能由本人在自助入口生成，管理员改用户表既建不出也抹不掉它。
+    keep_existing_tokens=False 仅供 generate_user_api_token 内部写回新 token 使用。
+    """
     validated = validate_system_users(users)
+    if keep_existing_tokens:
+        existing = STATE["config"]["users"]
+        for user in validated:
+            user["api_token"] = clean_value(existing.get(user["用户id"], {}).get("api_token"))
     path = users_json_path()
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(validated, ensure_ascii=False, indent=2), encoding="utf-8")
     STATE["config"]["users"] = {user["用户id"]: user for user in validated}
     return validated
+
+
+def new_api_token():
+    """URL 安全的随机 token：32 字节 → 43 个字符，可直接放进 header / URL / 配置。"""
+    return secrets.token_urlsafe(32)
+
+
+def generate_user_api_token(user_id):
+    """为指定用户生成新 token 并立即落盘，该用户此前的 token 全部失效。"""
+    user_id = clean_value(user_id)
+    if not user_id:
+        raise ValueError("用户id不能为空")
+    with LOCK:
+        current = STATE["config"]["users"]
+        if user_id not in current:
+            raise KeyError(user_id)
+        users = [dict(user) for user in current.values()]
+        target = next((user for user in users if user["用户id"] == user_id), None)
+        if target is None:
+            raise KeyError(user_id)
+        taken = {user.get("api_token") for user in users if user.get("api_token")}
+        token = new_api_token()
+        while token in taken:
+            token = new_api_token()
+        target["api_token"] = token
+        save_system_users(users, keep_existing_tokens=False)
+        return token
 
 
 def backup_sequence():

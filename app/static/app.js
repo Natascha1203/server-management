@@ -2,7 +2,7 @@ const APP_CAPABILITIES = window.APP_CAPABILITIES || [];
 const APP_USER = window.APP_USER || {};
 const SERVER_APPROVAL_HEADERS = ['序列号', '品牌', '型号', 'CPU型号', '网卡', '服务器成本(万)', '归属单位', '用途分类', '用途', '防火墙白名单', '资源申请编号', '是否液冷', '客户id', '客户名称', '所在机房', '所属机柜', '所属机位', '管理ip', '交易ip', '带外ip', '管理密码', '带外密码', '上架时间', '接入行情', '接入柜台', '备注'];
 const RACK_REVIEW_FILTER_FIELDS = ['序列号', '客户id', '客户名称', '所在机房'];
-const state = { entity: 'cabinets', records: [], meta: null, editing: null, pendingEditing: null, rackEditing: null, rackRequestStatus: 'pending', status: 'pending', reviewMode: 'allocation', stats: null, filters: [], sorts: [], reviewFilters: [], rackRequestFilters: [], changes: [], rackRequests: [], rackApprovalOptions: { rooms: [] }, rackSlotPick: {}, rackRequestExpanded: [], rackReviewExpanded: [], systemUsers: [], customerOptions: [], attachmentMap: {}, attachmentCounts: {}, attachmentModalSerial: '' };
+const state = { entity: 'cabinets', records: [], meta: null, editing: null, pendingEditing: null, rackEditing: null, rackRequestStatus: 'pending', status: 'pending', reviewMode: 'allocation', stats: null, filters: [], sorts: [], reviewFilters: [], rackRequestFilters: [], changes: [], rackRequests: [], rackApprovalOptions: { rooms: [] }, rackSlotPick: {}, rackRequestExpanded: [], rackReviewExpanded: [], systemUsers: [], customerOptions: [], fieldOptions: {}, fieldOptionsAdmin: null, attachmentMap: {}, attachmentCounts: {}, attachmentModalSerial: '' };
 const $ = s => document.querySelector(s);
 const $$ = s => [...document.querySelectorAll(s)];
 
@@ -88,9 +88,13 @@ function toDateInputValue(value) {
   return `${match[1]}-${match[2].padStart(2, '0')}-${match[3].padStart(2, '0')}`;
 }
 
-// 统一字段控件：多行字段 -> textarea（可拖拽调整大小），日期字段 -> date，其余 -> 单行 input
+// 统一字段控件：多行字段 -> textarea（可拖拽调整大小），日期字段 -> date，
+// 多值标签字段 -> 标签多选，其余 -> 单行 input
 function textFieldInput(field, value = '', extra = '') {
   const text = value ?? '';
+  if (isTagField(field)) {
+    return tagFieldHtml(field, text, String(extra).includes('readonly'));
+  }
   if (isMultilineField(field)) {
     return `<textarea name="${esc(field)}" rows="4"${extra}>${esc(text)}</textarea>`;
   }
@@ -103,6 +107,213 @@ function textFieldInput(field, value = '', extra = '') {
 // 多行字段的 label 需独占整行，避免编辑框被网格压窄
 function fieldLabelClass(field) {
   return isMultilineField(field) ? ' class="multiline"' : '';
+}
+
+/* ==== 多值标签字段（接入行情 / 接入柜台）====
+   存库仍是 "A, B" 文本，保证 Excel 可读、导入导出、审批 new_data 都不用改；
+   控件只是把它拆成可勾选的标签块，候选池由管理人员在设置页维护。 */
+const TAG_FIELDS = ['接入行情', '接入柜台'];
+const TAG_SPLIT_RE = /[,，、;；\r\n]+/;
+
+function isTagField(field) {
+  return TAG_FIELDS.includes(field);
+}
+
+function uniqueTags(list) {
+  const out = [];
+  (list || []).forEach(item => {
+    const tag = String(item ?? '').trim();
+    if (tag && !out.includes(tag)) out.push(tag);
+  });
+  return out;
+}
+
+function splitTags(value) {
+  if (Array.isArray(value)) return uniqueTags(value);
+  return uniqueTags(String(value ?? '').split(TAG_SPLIT_RE));
+}
+
+function joinTags(tags) {
+  return uniqueTags(tags).join(', ');
+}
+
+function tagChipHtml(tag, removable) {
+  const close = removable ? `<button type="button" class="tag-x" data-tag-remove="${esc(tag)}" aria-label="移除 ${esc(tag)}">×</button>` : '';
+  return `<span class="tag-chip">${esc(tag)}${close}</span>`;
+}
+
+function tagFieldHtml(field, value, readonly) {
+  const tags = splitTags(value);
+  return `<div class="tag-field${readonly ? ' readonly' : ''}" data-tag-field="${esc(field)}">` +
+    `<div class="tag-list">${tags.map(tag => tagChipHtml(tag, !readonly)).join('')}</div>` +
+    `<input class="tag-input" type="text" placeholder="${readonly ? '' : '点击选择标签，可搜索'}" autocomplete="off"${readonly ? ' readonly' : ''}>` +
+    '<div class="tag-menu" hidden></div>' +
+    `<input type="hidden" name="${esc(field)}" value="${esc(tags.join(', '))}">` +
+    '</div>';
+}
+
+function tagsOf(box) {
+  const hidden = box ? box.querySelector('input[type=hidden]') : null;
+  return splitTags(hidden ? hidden.value : '');
+}
+
+function setTags(box, tags) {
+  if (!box) return;
+  const list = uniqueTags(tags);
+  const hidden = box.querySelector('input[type=hidden]');
+  if (hidden) hidden.value = list.join(', ');
+  const holder = box.querySelector('.tag-list');
+  if (holder) holder.innerHTML = list.map(tag => tagChipHtml(tag, !box.classList.contains('readonly'))).join('');
+}
+
+// 候选 = 池里的标签 + 当前列表里已用到的（含池外历史值）
+function tagCandidates(box) {
+  const field = box.dataset.tagField;
+  const pool = state.fieldOptions[field] || [];
+  const used = [];
+  (state.records || []).forEach(row => splitTags(row[field]).forEach(tag => used.push(tag)));
+  return uniqueTags([...pool, ...used, ...tagsOf(box)]);
+}
+
+function renderTagMenu(box) {
+  const menu = box ? box.querySelector('.tag-menu') : null;
+  const input = box ? box.querySelector('.tag-input') : null;
+  if (!menu || !input) return;
+  const query = input.value.trim();
+  const current = tagsOf(box);
+  const all = tagCandidates(box);
+  const matches = all.filter(tag => !current.includes(tag) && comboMatch(tag, query));
+  const duplicate = all.some(tag => tag.toLowerCase() === query.toLowerCase());
+  const canCreate = isAdmin() && !!query && !duplicate;
+  let html = matches.map(tag => `<button type="button" class="tag-option" data-tag-value="${esc(tag)}">${esc(tag)}</button>`).join('');
+  if (canCreate) html += `<button type="button" class="tag-option tag-create" data-tag-create="${esc(query)}">＋ 新建标签「${esc(query)}」</button>`;
+  if (!matches.length && !canCreate) {
+    const hint = query ? (isAdmin() ? '无匹配标签，回车可新建' : '无匹配标签，请联系管理人员在设置页添加') : '暂无可选标签';
+    html += `<div class="tag-empty">${hint}</div>`;
+  }
+  menu.innerHTML = html;
+  menu.hidden = false;
+  box.classList.add('open');
+}
+
+function openTagMenu(box) {
+  if (!box || box.classList.contains('readonly')) return;
+  closeTagMenus(box);
+  renderTagMenu(box);
+}
+
+function closeTagMenu(box) {
+  if (!box) return;
+  const menu = box.querySelector('.tag-menu');
+  if (menu) menu.hidden = true;
+  box.classList.remove('open');
+}
+
+function closeTagMenus(keep) {
+  $$('[data-tag-field]').forEach(box => { if (box !== keep) closeTagMenu(box); });
+}
+
+function addTag(box, value) {
+  if (!box || !value) return;
+  const tags = tagsOf(box);
+  if (tags.includes(value)) return;
+  setTags(box, [...tags, value]);
+  const input = box.querySelector('.tag-input');
+  if (input) input.value = '';
+  renderTagMenu(box);
+}
+
+async function createAndAddTag(box, value) {
+  const field = box.dataset.tagField;
+  try {
+    const d = await api('/api/field-options', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ entity: 'servers', field, value }),
+    });
+    if (!state.fieldOptions[field]) state.fieldOptions[field] = [];
+    if (!state.fieldOptions[field].includes(d.value)) state.fieldOptions[field].push(d.value);
+    addTag(box, d.value);
+    toast(d.message);
+  } catch (e) {
+    toast(e.message, true);
+  }
+}
+
+function bindTagFields() {
+  document.addEventListener('click', event => {
+    const target = event.target instanceof Element ? event.target : null;
+    if (!target) return;
+    const removeBtn = target.closest('[data-tag-remove]');
+    if (removeBtn) {
+      const box = removeBtn.closest('[data-tag-field]');
+      const tag = removeBtn.dataset.tagRemove;
+      setTags(box, tagsOf(box).filter(item => item !== tag));
+      renderTagMenu(box);
+      return;
+    }
+    const option = target.closest('.tag-option');
+    if (option) {
+      event.preventDefault();
+      const box = option.closest('[data-tag-field]');
+      if (option.dataset.tagCreate) createAndAddTag(box, option.dataset.tagCreate);
+      else addTag(box, option.dataset.tagValue);
+      return;
+    }
+    const input = target.closest('.tag-input');
+    if (input) {
+      openTagMenu(input.closest('[data-tag-field]'));
+      return;
+    }
+    if (!target.closest('[data-tag-field]')) closeTagMenus();
+  });
+
+  document.addEventListener('focusin', event => {
+    const input = event.target instanceof Element ? event.target.closest('.tag-input') : null;
+    if (input) openTagMenu(input.closest('[data-tag-field]'));
+  });
+
+  document.addEventListener('input', event => {
+    const input = event.target instanceof Element ? event.target.closest('.tag-input') : null;
+    if (input) renderTagMenu(input.closest('[data-tag-field]'));
+  });
+
+  document.addEventListener('keydown', event => {
+    const input = event.target instanceof Element ? event.target.closest('.tag-input') : null;
+    if (!input) return;
+    const box = input.closest('[data-tag-field]');
+    if (event.key === 'Escape') {
+      closeTagMenu(box);
+      input.blur();
+      return;
+    }
+    if (event.key === 'Enter') {
+      event.preventDefault();
+      const first = box.querySelector('.tag-option');
+      const query = input.value.trim();
+      if (first && first.dataset.tagValue) addTag(box, first.dataset.tagValue);
+      else if (first && first.dataset.tagCreate) createAndAddTag(box, first.dataset.tagCreate);
+      else if (query && isAdmin()) createAndAddTag(box, query);
+      return;
+    }
+    if (event.key === 'Backspace' && !input.value) {
+      const tags = tagsOf(box);
+      if (tags.length) setTags(box, tags.slice(0, -1));
+    }
+  });
+}
+
+async function loadFieldOptions() {
+  try {
+    const d = await api('/api/field-options?entity=servers');
+    state.fieldOptions = {};
+    Object.entries(d.options || {}).forEach(([field, items]) => {
+      state.fieldOptions[field] = (items || []).map(item => item.value);
+    });
+    state.fieldOptionsAdmin = d;
+  } catch (e) {
+    // 标签池读不到不阻塞主流程：控件会退化成「只显示已有值」
+  }
 }
 
 function bindCustomerInputs(root = document) {
@@ -192,6 +403,7 @@ function openPage(b) {
   if (p === 'settings') {
     loadSettings();
     loadSystemUsers();
+    loadFieldOptions().then(renderFieldOptionsAdmin);
   }
 }
 
@@ -238,6 +450,13 @@ async function loadEntity() {
   renderTable();
 }
 
+// 多值标签字段在表格里渲染成一串小标签，其余字段保持纯文本
+function cellTextHtml(field, value) {
+  if (!isTagField(field)) return esc(value);
+  const tags = splitTags(value);
+  return tags.length ? `<span class="cell-tags">${tags.map(tag => `<span class="tag">${esc(tag)}</span>`).join('')}</span>` : '';
+}
+
 function renderTable() {
   const rows = state.records;
   const cols = state.meta.headers;
@@ -251,7 +470,7 @@ function renderTable() {
     const editPending = pending && r._pending_operation !== '删除' ? `<button class="mini" onclick="openPendingEdit(${index})">编辑待审批</button>` : '';
     const pendingAction = pending ? `<button class="mini" onclick="showPendingChange(${index})">查看待审批</button>${editPending}<button class="mini delete" onclick="withdrawPendingChange(${index})">撤回</button>` : '';
     const attachAction = state.entity === 'servers' ? attachmentButton(r) : '';
-    return `<tr${rowClass}><td class="select-col"><input class="row-select" type="checkbox" data-index="${index}" title="选择"${disabled}></td><td>${pendingStatus(r)}</td><td><div class="row-actions">${pendingAction}<button class="mini" onclick="openEdit('${encoded}')"${disabled}>修改</button><button class="mini delete" onclick="removeRow('${encoded}')"${disabled}>删除</button>${attachAction}</div></td>${cols.map(h => `<td class="cell-text">${esc(r[h])}</td>`).join('')}</tr>`;
+    return `<tr${rowClass}><td class="select-col"><input class="row-select" type="checkbox" data-index="${index}" title="选择"${disabled}></td><td>${pendingStatus(r)}</td><td><div class="row-actions">${pendingAction}<button class="mini" onclick="openEdit('${encoded}')"${disabled}>修改</button><button class="mini delete" onclick="removeRow('${encoded}')"${disabled}>删除</button>${attachAction}</div></td>${cols.map(h => `<td class="cell-text${isTagField(h) ? ' cell-tags-cell' : ''}">${cellTextHtml(h, r[h])}</td>`).join('')}</tr>`;
   }).join('') : '<tr><td class="empty" colspan="99">暂无正式数据</td></tr>';
   $('#selectAllRows').onchange = e => {
     $$('.row-select:not(:disabled)').forEach(input => input.checked = e.target.checked);
@@ -987,6 +1206,7 @@ async function openModal(mode, row = {}) {
   if (state.entity === 'servers') {
     try {
       await loadCustomerOptions();
+      await loadFieldOptions();
       await loadCabinetOptions(row);
       renderServerForm(row);
     } catch (e) {
@@ -1970,7 +2190,16 @@ async function loadSystemUsers() {
 }
 
 function renderSystemUsers() {
-  $('#systemUsersBody').innerHTML = state.systemUsers.map((user, index) => `<tr data-index="${index}"><td><input name="用户id" value="${esc(user['用户id'] || '')}"></td><td><input name="密码" value="${esc(user['密码'] || '')}"></td><td><select name="身份">${['管理人员','机房人员','业务人员'].map(role => `<option${role === user['身份'] ? ' selected' : ''}>${role}</option>`).join('')}</select></td><td><input name="业务单位" value="${esc(user['业务单位'] || '')}"></td><td><input name="所属机房" value="${esc(user['所属机房'] || '')}"></td><td><input type="hidden" name="api_token" value="${esc(user['api_token'] || '')}"><button class="mini delete" type="button" onclick="removeSystemUser(${index})">删除</button></td></tr>`).join('');
+  $('#systemUsersBody').innerHTML = state.systemUsers.map((user, index) => `<tr data-index="${index}"><td><input name="用户id" value="${esc(user['用户id'] || '')}"></td><td><input name="密码" value="${esc(user['密码'] || '')}"></td><td><select name="身份">${['管理人员','机房人员','业务人员'].map(role => `<option${role === user['身份'] ? ' selected' : ''}>${role}</option>`).join('')}</select></td><td><input name="业务单位" value="${esc(user['业务单位'] || '')}"></td><td><input name="所属机房" value="${esc(user['所属机房'] || '')}"></td><td><div class="row-actions"><button class="mini delete" type="button" onclick="removeSystemUser(${index})">删除</button></div></td></tr>`).join('');
+}
+
+async function copyTokenText(text) {
+  try {
+    await navigator.clipboard.writeText(text);
+    toast('Token 已复制到剪贴板');
+  } catch (e) {
+    toast('复制失败，请手动选中复制', true);
+  }
 }
 
 function collectSystemUsers() {
@@ -1992,6 +2221,106 @@ async function saveSystemUsers() {
     toast(e.message, true);
   }
 }
+
+/* ==== 设置页：字段标签集中管理（仅管理人员）==== */
+function renderFieldOptionsAdmin() {
+  const box = $('#fieldOptionsPanels');
+  if (!box) return;
+  const data = state.fieldOptionsAdmin;
+  const fields = data ? Object.entries(data.options || {}) : [];
+  if (!fields.length) {
+    box.innerHTML = '<p class="muted">当前没有需要维护的标签字段。</p>';
+    return;
+  }
+  box.innerHTML = fields.map(([field, items]) => {
+    const rows = (items || []).map(item => {
+      const usage = item.usage || {};
+      const official = usage.official || 0;
+      const pending = usage.pending || 0;
+      const used = official + pending;
+      const scope = used ? `服务器 ${official} 台${pending ? ` / 待审批 ${pending} 条` : ''}` : '未使用';
+      const encoded = encodeURIComponent(item.value);
+      const source = item.source === 'data' ? ' <span class="tag-src">来自数据</span>' : '';
+      return `<li class="tag-admin-row"><span class="tag-chip">${esc(item.value)}${source}</span>` +
+        `<span class="tag-admin-usage${used ? '' : ' muted'}">${esc(scope)}</span>` +
+        `<span class="tag-admin-actions">` +
+        `<button class="mini" type="button" onclick="renameFieldOption('${esc(field)}','${encoded}')">改名</button>` +
+        `<button class="mini delete" type="button" onclick="deleteFieldOption('${esc(field)}','${encoded}')"${used ? ' title="仍有记录在使用，只能改名"' : ''}>删除</button>` +
+        '</span></li>';
+    }).join('');
+    return `<div class="tag-admin-panel" data-tag-admin="${esc(field)}">` +
+      `<div class="tag-admin-head"><b>${esc(field)}</b><span class="muted">${(items || []).length} 个标签</span></div>` +
+      `<ul class="tag-admin-list">${rows || '<li class="muted">还没有标签，先在下方添加</li>'}</ul>` +
+      `<div class="tag-admin-add"><input class="tag-admin-input" type="text" placeholder="新增标签，回车或点添加">` +
+      `<button class="btn ghost mini" type="button" onclick="addFieldOption('${esc(field)}', this)">＋ 添加</button></div>` +
+      '</div>';
+  }).join('');
+  $$('.tag-admin-input').forEach(input => {
+    input.onkeydown = event => {
+      if (event.key !== 'Enter') return;
+      event.preventDefault();
+      addFieldOption(input.closest('[data-tag-admin]').dataset.tagAdmin, input);
+    };
+  });
+}
+
+window.addFieldOption = async (field, source) => {
+  const panel = source && source.closest ? source.closest('[data-tag-admin]') : null;
+  const input = panel ? panel.querySelector('.tag-admin-input') : null;
+  const value = (input ? input.value : '').trim();
+  if (!value) return;
+  try {
+    const d = await api('/api/field-options', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ entity: 'servers', field, value }),
+    });
+    if (input) input.value = '';
+    toast(d.message);
+    await loadFieldOptions();
+    renderFieldOptionsAdmin();
+  } catch (e) {
+    toast(e.message, true);
+  }
+};
+
+window.renameFieldOption = async (field, encoded) => {
+  const value = decodeURIComponent(encoded);
+  const next = prompt(`把标签「${value}」改名为：`, value);
+  if (next === null) return;
+  const newValue = next.trim();
+  if (!newValue || newValue === value) return;
+  try {
+    const d = await api('/api/field-options', {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ entity: 'servers', field, value, new_value: newValue }),
+    });
+    toast(d.message);
+    await loadFieldOptions();
+    renderFieldOptionsAdmin();
+    loadEntity().catch(() => {});
+  } catch (e) {
+    toast(e.message, true);
+  }
+};
+
+window.deleteFieldOption = async (field, encoded) => {
+  const value = decodeURIComponent(encoded);
+  if (!confirm(`确认删除标签「${value}」？\n仍有服务器或待审批在用的标签不允许删除，只能改名。`)) return;
+  try {
+    const d = await api('/api/field-options', {
+      method: 'DELETE',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ entity: 'servers', field, value }),
+    });
+    toast(d.message);
+    await loadFieldOptions();
+    renderFieldOptionsAdmin();
+  } catch (e) {
+    toast(e.message, true);
+  }
+};
 
 window.review = async (id, action) => {
   let reason = '';
@@ -2091,36 +2420,57 @@ async function exportRackRequests() {
 
 if ($('#bulkExportBtn')) $('#bulkExportBtn').onclick = exportRackRequests;
 
-async function toggleTokenPop() {
-  const pop = $('#tokenPop');
-  const body = $('#tokenBody');
-  if (!pop || !body) return;
-  if (!pop.hidden) { pop.hidden = true; return; }
-  body.innerHTML = '<p class="token-tip">读取中…</p>';
-  pop.hidden = false;
-  let token = '';
+async function fetchMyToken() {
   try {
     const r = await fetch('/api/my-token');
     if (r.ok) {
       const d = await r.json();
-      token = String(d.api_token || '').trim();
+      return String(d.api_token || '').trim();
     }
   } catch (e) {
-    token = '';
+    /* 网络异常按无 token 处理，由用户点生成 */
   }
+  return '';
+}
+
+async function renderTokenPop() {
+  const body = $('#tokenBody');
+  if (!body) return;
+  body.innerHTML = '<p class="token-tip">读取中…</p>';
+  const token = await fetchMyToken();
   if (token) {
-    body.innerHTML = `<code>${esc(token)}</code><div class="token-actions"><button class="btn ghost" type="button" id="tokenCopy">复制</button></div>`;
+    body.innerHTML = `<code>${esc(token)}</code><div class="token-actions"><button class="btn ghost" type="button" id="tokenCopy">复制</button><button class="btn ghost" type="button" id="tokenRegen">重新生成</button></div>`;
     const copy = $('#tokenCopy');
-    if (copy) copy.onclick = async () => {
-      try {
-        await navigator.clipboard.writeText(token);
-        toast('Token 已复制到剪贴板');
-      } catch (e) {
-        toast('复制失败，请手动选中复制', true);
-      }
-    };
+    if (copy) copy.onclick = () => copyTokenText(token);
+    const regen = $('#tokenRegen');
+    if (regen) regen.onclick = regenerateMyToken;
   } else {
-    body.innerHTML = '<p class="token-tip">暂无token,联系管理员获取</p>';
+    body.innerHTML = '<p class="token-tip">你还没有 API token。生成后可直接用于 MCP / API 调用。</p><div class="token-actions"><button class="btn primary" type="button" id="tokenCreate">生成 Token</button></div>';
+    const create = $('#tokenCreate');
+    if (create) create.onclick = regenerateMyToken;
+  }
+}
+
+async function toggleTokenPop() {
+  const pop = $('#tokenPop');
+  if (!pop) return;
+  if (!pop.hidden) { pop.hidden = true; return; }
+  pop.hidden = false;
+  await renderTokenPop();
+}
+
+async function regenerateMyToken() {
+  const existed = await fetchMyToken();
+  const tip = existed
+    ? '重新生成后，当前 token 立即失效（正在使用它的 MCP / 脚本会无法访问）。继续？'
+    : '生成后可直接用于 MCP / API 调用。继续？';
+  if (!confirm(tip)) return;
+  try {
+    const d = await api('/api/my-token/regenerate', { method: 'POST' });
+    toast(d.message || 'Token 已生成');
+    await renderTokenPop();
+  } catch (e) {
+    toast(e.message, true);
   }
 }
 
@@ -2137,13 +2487,14 @@ function closeKeyMenu() {
 
 if ($('#tokenBtn')) $('#tokenBtn').onclick = e => { e.stopPropagation(); toggleKeyMenu(); };
 if ($('#keyMenuToken')) $('#keyMenuToken').onclick = () => { closeKeyMenu(); toggleTokenPop(); };
-if ($('#keyMenuSkill')) $('#keyMenuSkill').onclick = () => { closeKeyMenu(); downloadSkill(); };
+if ($('#keyMenuMcp')) $('#keyMenuMcp').onclick = () => { closeKeyMenu(); downloadMcpPackage(); };
 if ($('#tokenClose')) $('#tokenClose').onclick = () => { const p = $('#tokenPop'); if (p) p.hidden = true; };
 document.addEventListener('click', () => closeKeyMenu());
 
-async function downloadSkill() {
+// 下载 MCP 服务包：后端实时从 mcp_server/ 目录打包，下载到的就是当前线上代码
+async function downloadMcpPackage() {
   try {
-    const r = await fetch('/api/skill/download');
+    const r = await fetch('/api/mcp/download');
     if (!r.ok) {
       let msg = '下载失败';
       try { const d = await r.json(); msg = d.error || msg; } catch (e) {}
@@ -2154,11 +2505,13 @@ async function downloadSkill() {
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
     a.href = url;
-    a.download = 'server_management_skill.zip';
+    a.download = 'server_management_mcp.zip';
     document.body.appendChild(a);
     a.click();
     a.remove();
     URL.revokeObjectURL(url);
+    const version = r.headers.get('X-MCP-Version');
+    toast(version ? `MCP 包已下载（版本 ${version}）` : 'MCP 包已下载');
   } catch (e) {
     toast('下载失败：' + (e.message || e), true);
   }
@@ -2434,6 +2787,8 @@ function bindStatsFilters() {
 
 bindStatsFilters();
 bindFieldCombos();
+bindTagFields();
+loadFieldOptions();
 if ($('#rackRequestForm')) {
   const form = $('#rackRequestForm');
   loadCustomerOptions().then(() => bindCustomerInputs(form)).catch(e => toast(e.message, true));
