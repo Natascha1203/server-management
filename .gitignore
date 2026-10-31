@@ -1,0 +1,23 @@
+# 白名单模式：默认忽略一切，只放行需要版本化的源码/文档目录
+*
+!*/
+!.gitignore
+
+!app/
+!app/**
+!scripts/
+!scripts/**
+!mcp_server/
+!mcp_server/**
+!docs/
+!docs/**
+!server_management_skill/
+!server_management_skill/**
+
+# 编译器产物与本地配置，一律不进仓库
+__pycache__/
+*.pyc
+*.pyo
+app.ini
+data/
+*.zip
