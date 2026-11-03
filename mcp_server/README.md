@@ -131,8 +131,8 @@ Windows 上把 `command` 换成 python 的绝对路径（如
 | `sm_query` | 查记录，`filters` 为包含匹配，受后端行级权限裁剪 |
 | `sm_stats` | 机位与服务器统计 |
 | `sm_rack_list` | 上下架请求摘要列表 |
-| `sm_rack_get` | 单个请求的完整内容（`request_data` 已解开成对象） |
-| `sm_upsert` | 新增 / 修改记录；改记录只给要改的字段，工具自动合并原值。`接入行情`/`接入柜台` 可传数组，服务端去重成 `A, B` |
+| `sm_rack_get` | 单个请求的完整内容（`request_data` 已解开成对象；变更请求额外带 `base_data`） |
+| `sm_upsert` | 新增 / 修改记录；改记录只给要改的字段，工具自动合并原值。`用途分类`/`接入行情`/`接入柜台` 可传数组，服务端去重成 `A, B` |
 | `sm_delete` | 删记录，**必须同时给 `keys` 与内容完全相同的 `confirm_keys`**，否则拒绝执行 |
 | `sm_pending` | 待审批变更申请（拿 `change_id`）；非管理人员降级为 pending 数据视图 |
 | `sm_review` | 审批变更申请（`approve` / `reject`），仅管理人员 |

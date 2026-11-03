@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """导出 SQLite 中的上下架请求为 xlsx。
 
-列格式与「导入上下架表」模板一致（17 列），末尾多一列「审核状态」：
+列格式与「导入上下架表」模板一致（18 列），末尾多一列「审核状态」：
   待审核(机位IP分配) / 待审核(具体实施) / 已驳回 / 已通过
 
 用法示例：
@@ -12,7 +12,7 @@
   python scripts/export_rack_requests.py --data-dir ../data       # 指定数据目录
 
 数据目录定位优先级：--data-dir > --ini 指定的配置 > 项目根 app.ini > 项目根 data/
-导出的文件多出的「审核状态」列在回传导入时会被自动忽略（只识别 17 个标准列）。
+导出的文件多出的「审核状态」列在回传导入时会被自动忽略（只识别 18 个标准列）。
 """
 from __future__ import annotations
 
@@ -136,7 +136,7 @@ def main() -> int:
     ws.freeze_panes = "A2"
     for index, header in enumerate(headers, start=1):
         width = max(len(header) * 2, 12)
-        if header in ("防火墙白名单", "上下架需求", "备注"):
+        if header in ("防火墙白名单", "备注"):
             width = 40
         ws.column_dimensions[ws.cell(row=1, column=index).column_letter].width = width
 

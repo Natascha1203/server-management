@@ -47,14 +47,24 @@ IP_RANGE_FIELDS = {"管理ip": "管理ip网段", "交易ip": "交易ip网段", "
 
 # 多值标签字段：单元格里存 "A, B" 形式文本（Excel 可读），表单里按标签多选。
 # 每个字段维护独立的候选池（field_options 表），池只能由管理人员维护。
-MULTI_VALUE_FIELDS = {"servers": ("接入行情", "接入柜台")}
+MULTI_VALUE_FIELDS = {"servers": ("用途分类", "接入行情", "接入柜台")}
 TAG_SEPARATOR_PATTERN = re.compile(r"[,，、;；\r\n]+")
 TAG_JOINER = ", "
 TAG_MAX_LENGTH = 40      # 单个标签最大长度
 TAG_MAX_COUNT = 20       # 单条记录单字段最多几个标签
 TAG_MAX_OPTIONS = 200    # 单个字段候选池上限
 
-RACK_REQUEST_HEADERS = ["序列号", "品牌", "型号", "CPU型号", "网卡", "服务器成本(万)", "防火墙白名单", "资源申请编号", "是否液冷", "是否上架", "是否重装系统", "初始密码", "上下架需求", "备注", "客户id", "客户名称", "所在机房"]
+# 请求类型决定走哪条流程：
+#   上架 → 先机位IP分配，再具体实施（新增服务器记录）
+#   下架 / 变更 → 直接进具体实施（下架移入回收站，变更改完直接落正式表）
+REQUEST_TYPES = ("上架", "下架", "变更")
+RACK_REQUEST_HEADERS = [
+    "序列号", "请求类型", "品牌", "型号", "CPU型号", "网卡", "服务器成本(万)",
+    "防火墙白名单", "资源申请编号", "是否液冷", "接入行情", "接入柜台",
+    "是否重装系统", "初始密码", "备注", "客户id", "客户名称", "所在机房",
+]
+# 请求表里的多值标签字段（复用 servers 的候选池，语义一致）
+RACK_REQUEST_MULTI_VALUE_FIELDS = ("接入行情", "接入柜台")
 RACK_REQUEST_META = {"label": "上下架请求", "sheet": "上下架请求", "headers": RACK_REQUEST_HEADERS}
 # 导出时在请求字段基础上追加机位/IP 分配结果，便于在机位IP分配/具体实施阶段留档
 RACK_REQUEST_EXPORT_HEADERS = RACK_REQUEST_HEADERS + ["所属机柜", "所属机位", "管理ip", "交易ip", "带外ip"]
@@ -132,6 +142,13 @@ def join_tags(values):
 def normalize_field_value(entity, field, value):
     """写库前的字段归一：多值字段统一分隔符，其余字段按原样 clean。"""
     if is_multi_value_field(entity, field):
+        return join_tags(value)
+    return clean_value(value)
+
+
+def normalize_rack_request_value(field, value):
+    """上下架请求字段归一：请求表不在 ENTITIES 里，多值字段单独声明。"""
+    if field in RACK_REQUEST_MULTI_VALUE_FIELDS:
         return join_tags(value)
     return clean_value(value)
 

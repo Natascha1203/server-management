@@ -141,6 +141,18 @@ ATTACHMENTS_SCHEMA = """CREATE TABLE IF NOT EXISTS attachments (
 
 # 字段候选标签池（目前用于 servers 的「接入行情」「接入柜台」多选）。
 # 只存元数据，不参与 Excel 导出/版本快照；记录里仍保存 "A, B" 文本。
+# 回收站：下架实施完成时把服务器整行快照挪进来，服务器表随即删掉该行。
+# 只有管理人员能看/恢复/永久删除；恢复时可改客户与机位（重新上架）。
+TRASH_SCHEMA = """CREATE TABLE IF NOT EXISTS trash (
+    id TEXT PRIMARY KEY,
+    serial_number TEXT NOT NULL,
+    data TEXT NOT NULL,
+    request_id TEXT NOT NULL DEFAULT '',
+    deleted_at TEXT NOT NULL,
+    deleted_by TEXT NOT NULL DEFAULT '',
+    reason TEXT NOT NULL DEFAULT ''
+)"""
+
 FIELD_OPTIONS_SCHEMA = """CREATE TABLE IF NOT EXISTS field_options (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     entity TEXT NOT NULL,
@@ -207,6 +219,12 @@ def ensure_attachments_schema(conn):
     # 早期版本可能没有这两列，补齐以免 SELECT 报错
     add_column_if_missing(conn, "attachments", "request_id", "request_id TEXT NOT NULL DEFAULT ''")
     add_column_if_missing(conn, "attachments", "source", "source TEXT NOT NULL DEFAULT ''")
+
+
+def ensure_trash_schema(conn):
+    conn.execute(TRASH_SCHEMA)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_trash_serial ON trash(serial_number)")
+    add_column_if_missing(conn, "trash", "reason", "reason TEXT NOT NULL DEFAULT ''")
 
 
 def ensure_field_options_schema(conn):
@@ -521,6 +539,7 @@ def init_storage():
         ensure_rack_requests_schema(conn)
         ensure_attachments_schema(conn)
         ensure_field_options_schema(conn)
+        ensure_trash_schema(conn)
         conn.execute(SETTINGS_SCHEMA)
         conn.execute("CREATE INDEX IF NOT EXISTS idx_changes_status ON changes(status)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_rack_requests_status ON rack_requests(status)")

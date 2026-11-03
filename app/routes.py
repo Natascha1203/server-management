@@ -136,6 +136,18 @@ def filling_instructions_path():
     return Path(storage.STATE["config"]["base_dir"]) / "docs" / "信息维护填写说明.md"
 
 
+def static_asset_version():
+    """前端资源版本号：取 style.css / app.js 的最新修改时间，避免改样式后浏览器仍用缓存。"""
+    static_dir = Path(__file__).resolve().parent / "static"
+    stamps = []
+    for name in ("style.css", "app.js"):
+        try:
+            stamps.append(int((static_dir / name).stat().st_mtime))
+        except OSError:
+            continue
+    return str(max(stamps)) if stamps else "1"
+
+
 @bp.route("/")
 def index():
     if not session.get("username"):
@@ -149,6 +161,7 @@ def index():
         app_user=user,
         capabilities=capabilities_for(user),
         entities=ENTITIES,
+        asset_version=static_asset_version(),
     )
 
 
@@ -1253,7 +1266,7 @@ def update_rack_request(request_id):
         duplicate = services.pending_rack_request_duplicate(conn, data["序列号"], request_id)
         if duplicate:
             return jsonify(error=f"序列号 {data['序列号']} 已有待审核上下架请求"), 409
-        request_type = "上架" if data["是否上架"] == "是" else "下架"
+        request_type = data["请求类型"]
         stage = initial_rack_request_stage(request_type)
         was_rejected = row["status"] == "rejected"
         submitted_at = now_text() if was_rejected else row["submitted_at"]
@@ -1370,8 +1383,13 @@ def review_rack_request(request_id):
             return jsonify(message="服务器机位IP分配已完成，已进入具体实施", request_id=request_id)
         if stage != "implementation":
             return jsonify(error="请求当前阶段不可审核"), 400
-        if row["request_type"] == "上架":
-            server_data = services.rack_server_draft(row, body.get("server_data") or {})
+        if row["request_type"] in {"上架", "变更"}:
+            base = None
+            if row["request_type"] == "变更":
+                base = next((item for item in storage.read_records("servers") if item["序列号"] == row["serial_number"]), None)
+                if not base:
+                    return jsonify(error="服务器记录不存在"), 409
+            server_data = services.rack_server_draft(row, body.get("server_data") or {}, base=base)
             # 具体实施阶段调整机位/IP 时，不得占用其他待实施请求已分配的资源
             conflict_errors = services.implementation_slot_conflict_errors(server_data, request_id) + services.same_kind_ip_conflict_errors(
                 services.normalize_row("servers", server_data),
@@ -1388,6 +1406,46 @@ def review_rack_request(request_id):
             return jsonify(error="；".join(errors)), 400 if "不存在" not in "；".join(errors) else 409
         storage.prune_audit_records(conn)
     return jsonify(message=message, request_id=request_id)
+
+
+# ---------------------------------------------------------------- 回收站
+# 下架实施完成后服务器整行进回收站；只有管理人员能看、能重新上架、能永久删除。
+
+@bp.get("/api/trash")
+@require_login
+def trash_api():
+    if "manage_settings" not in capabilities_for(current_user()):
+        return forbidden()
+    return jsonify(items=[services.trash_to_json(row) for row in services.trash_rows()])
+
+
+@bp.post("/api/trash/<trash_id>/restore")
+@require_login
+def restore_trash_api(trash_id):
+    user = current_user()
+    if "manage_settings" not in capabilities_for(user):
+        return forbidden()
+    body = request.get_json(silent=True) or {}
+    try:
+        with storage.LOCK:
+            record = services.restore_trash(trash_id, body.get("server_data") or {}, actor=user["用户id"])
+    except ValueError as exc:
+        return jsonify(error=str(exc)), 400
+    return jsonify(message=f"序列号 {record['序列号']} 已重新上架", record=record)
+
+
+@bp.delete("/api/trash/<trash_id>")
+@require_login
+def purge_trash_api(trash_id):
+    user = current_user()
+    if "manage_settings" not in capabilities_for(user):
+        return forbidden()
+    try:
+        with storage.LOCK:
+            result = services.purge_trash(trash_id, actor=user["用户id"])
+    except ValueError as exc:
+        return jsonify(error=str(exc)), 404
+    return jsonify(message=f"序列号 {result['serial_number']} 已永久删除，连带资料 {result['attachments']} 个", **result)
 
 
 # ---------------------------------------------------------------- 服务器资料（附件）

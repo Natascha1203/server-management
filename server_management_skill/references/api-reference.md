@@ -97,10 +97,21 @@ Body: {"filters":[{"field":"序列号","pattern":"^SN-"}],
 
 ### 2.4 上下架请求（rack-requests，两阶段审批）
 
-字段（RACK_REQUEST_HEADERS）：序列号、品牌、型号、CPU型号、网卡、服务器成本(万)、防火墙白名单、资源申请编号、是否液冷、是否上架、是否重装系统、初始密码、上下架需求、备注、客户id、客户名称、所在机房
+字段（RACK_REQUEST_HEADERS）：序列号、请求类型、品牌、型号、CPU型号、网卡、服务器成本(万)、防火墙白名单、资源申请编号、是否液冷、接入行情、接入柜台、是否重装系统、初始密码、备注、客户id、客户名称、所在机房
 
 **提交**：`POST /api/rack-requests`，Body 为请求字段 → `{"message":"上下架请求已提交","request_id":"..."}`
-- `是否上架` 取 `"是"`/`"否"`。
+
+- `请求类型` 取 `"上架"` / `"下架"` / `"变更"`，决定走哪条流程：
+
+| 请求类型 | 初始 stage | 实施完成后的动作 |
+|---|---|---|
+| 上架 | `allocation`（机位IP分配） | 新增一条服务器记录 |
+| 下架 | `implementation`（具体实施） | 服务器整行移入**回收站**，服务器表删掉该行 |
+| 变更 | `implementation`（具体实施） | 以现有记录为底合并 `server_data`，直接写入正式表（序列号不可改） |
+
+- 上架要求序列号**不在**服务器表里；下架 / 变更要求序列号**已存在**（客户与机房留空时会从服务器记录补齐）。
+- `下架` 请求的客户id / 所在机房必须与服务器记录一致（防止顺手改台账）。
+- `接入行情` / `接入柜台` 是多值标签，可传数组或 `"A, B"` 文本。
 
 **查询**：`GET /api/rack-requests?status=pending|approved|rejected&scope=review|submitted&stage=allocation|implementation`
 
@@ -135,9 +146,12 @@ Body 结构：
 | | 第 1 次 | 第 2 次 |
 |---|---|---|
 | 调用前 `stage` | `allocation`（机位IP分配） | `implementation`（具体实施） |
-| 返回文案 | 「服务器机位IP分配已完成，已进入具体实施」 | 「服务器上下架具体实施已完成，已生成版本 V…」 |
+| 返回文案 | 「服务器机位IP分配已完成，已进入具体实施」 | 「服务器上架具体实施已完成，已生成版本 V…」 |
 | 系统动作 | 把 `server_data` 存入 `stage_data`，阶段推进 | 用 `server_data` 生成记录写入 **servers 表**，`status→approved`、`stage→completed`，并生成版本快照 |
 
+- **下架 / 变更只有第 2 次调用**（初始 stage 就是 `implementation`），一次 `approve` 即完成：
+  - 下架：服务器整行进回收站，返回「服务器下架具体实施已完成」；
+  - 变更：`server_data` 以现有记录为底合并后写回正式表，返回「服务器变更具体实施已完成」。
 - `action=reject`：Body `{"action":"reject","reason":"驳回原因"}`（两阶段均可驳回）。
 - 第 2 次可省略 `server_data`（沿用第 1 次存的 `stage_data`），但显式传同样内容行为更确定。
 
@@ -182,7 +196,22 @@ files=<file1> & files=<file2> ...   # 也接受 file 字段名
 
 改/删权限：管理人员、上传者本人、该序列号所属机房的机房人员。
 
-### 2.6 其他
+### 2.6 回收站（trash，仅管理人员）
+
+下架实施完成时，服务器整行快照写入 `trash` 表，服务器表删掉该行。**只有管理人员**能访问这三个接口（其他人 403）。
+
+**列表**：`GET /api/trash` → `{"items":[{id, serial_number, 序列号, 客户id, 客户名称, 所在机房, 所属机柜, 所属机位, ..., deleted_at, deleted_by, reason}]}`
+（快照字段直接摊平在对象顶层，与服务器记录同名字段一致）
+
+**重新上架**：`POST /api/trash/<trash_id>/restore`，Body `{"server_data":{"客户id":"2","所属机位":"8-9"}}`
+- `server_data` 可省略；提供时覆盖快照里的同名字段（允许改客户与机位）。
+- 会走完整的服务器校验：客户必须已登记、机柜/机位必须在机柜表范围内、机位与 IP 不得被占用。
+- 冲突时返回 400 并说明原因（客户不存在 / 机位已被服务器 X 占用 / 序列号已存在），**回收站记录保留**。
+
+**永久删除**：`DELETE /api/trash/<trash_id>`
+- 连带删除该序列号的全部资料附件（`attachments` 行 + `data/archive/<序列号>/` 文件），不可恢复。
+
+### 2.7 其他
 
 - 统计：`GET /api/statistics` → `{"summary":{cabinet_count,server_count,client_count}, "cabinets":[...], "rooms":[{"name":机房名,"cabinet_count","slot_total","slot_occupied","cabinets":[...]}]}`
   - `rooms` 为**按机房分组**的机柜列表，用于页面按机房分区展示；`cabinets` 为扁平列表（兼容旧用法）。
@@ -193,9 +222,9 @@ files=<file1> & files=<file2> ...   # 也接受 file 字段名
 - 填写说明：`GET /api/filling-instructions`
 - 健康检查（无需鉴权）：`GET /health`
 
-### 2.7 字段标签（接入行情 / 接入柜台候选池）
+### 2.8 字段标签（用途分类 / 接入行情 / 接入柜台候选池）
 
-`servers` 的 `接入行情` / `接入柜台` 是**多值字段**：存 `A, B` 文本（Excel 可读），写入时也接受数组，服务端去重后按 `, ` 拼接。候选标签池存在 SQLite 的 `field_options` 表（不进 Excel、不进版本快照）。
+`servers` 的 `用途分类` / `接入行情` / `接入柜台` 是**多值字段**：存 `A, B` 文本（Excel 可读），写入时也接受数组，服务端去重后按 `, ` 拼接。每个字段有**各自独立**的候选标签池，存在 SQLite 的 `field_options` 表（不进 Excel、不进版本快照）。上下架请求表的 `接入行情` / `接入柜台` 复用 `servers` 的池。
 
 | 端点 | 权限 | 说明 |
 |---|---|---|
@@ -206,9 +235,9 @@ files=<file1> & files=<file2> ...   # 也接受 file 字段名
 
 - 标签规则：单个标签 ≤ 40 字，不能包含 `,` `，` `、` `;`（它们是分隔符）；单字段候选池 ≤ 200 个；单条记录单字段 ≤ 20 个标签。导入时这些分隔符都认，重复标签自动去重。
 - **自动收纳**：记录里出现、池里没有的值（直接改 Excel、历史导入、API 写入）会在下次读取候选池时自动进池，`source` 标记 `data`。
-- `GET /api/skill/schema` 的 `entities.servers.multi_value_fields` 会列出这两个字段名，agent 不需要猜。
+- `GET /api/skill/schema` 的 `entities.servers.multi_value_fields` 会列出这三个字段名，agent 不需要猜。
 
-### 2.8 API Token（本人自助生成）
+### 2.9 API Token（本人自助生成）
 
 Token 不再需要手工写 `data/users.json`，也**不存在管理员代发**：每人自己在页面上生成，管理员看不到也改不了他人的 token。
 
@@ -225,7 +254,7 @@ Token 不再需要手工写 `data/users.json`，也**不存在管理员代发**�
 - 常见错误：`403` 用 token 换发 / 非管理员访问用户表；`404` 当前账号不在用户配置中；`401` 未登录。
 
 
-### 2.9 skill 文档分发（免鉴权只读）
+### 2.10 skill 文档分发（免鉴权只读）
 
 供 MCP server 与 agent 获取**当前实现**的字段与文档，避免手写副本过期。
 
@@ -241,7 +270,7 @@ Token 不再需要手工写 `data/users.json`，也**不存在管理员代发**�
 - 与 2.6 的 `GET /api/skill/download`（需登录、返回 zip）并存：后者是给不支持 MCP 的 host 的兜底。
 - 页面上的下载入口现在下载的是 **MCP 包**（见 2.10），不是 skill zip。
 
-### 2.10 MCP 服务包下载（需登录）
+### 2.11 MCP 服务包下载（需登录）
 
 | 端点 | 权限 | 说明 |
 |---|---|---|

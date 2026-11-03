@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
   <title>服务器资产管理系统</title>
-  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}?v={{ asset_version }}">
 </head>
 <body data-role="{{ role }}">
   <aside class="sidebar">
@@ -18,6 +18,7 @@
       </div>
       <button class="nav-item" data-page="statistics" data-capability="view_statistics"><span>▥</span> 机柜统计</button>
       <button class="nav-item" data-page="rackRequests" data-capability="submit_rack_request"><span>⇅</span> 上下架请求</button>
+      <button class="nav-item" data-page="trash" data-capability="manage_settings"><span>🗑</span> 回收站 <i id="trashBadge" class="badge" hidden>0</i></button>
       <button class="nav-item" data-page="settings" data-capability="manage_settings"><span>⚙</span> 设置</button>
     </nav>
     <div class="account"><div class="avatar">{{ username[0]|upper }}</div><div><b>{{ username }}</b><small>{{ role_name }}</small></div><div class="key-menu-wrap"><button id="tokenBtn" type="button" title="账号工具">🔑</button><div id="keyMenu" class="key-menu" hidden><button id="keyMenuToken" type="button">🔑 获取 Token</button><button id="keyMenuMcp" type="button">⬇ 下载 MCP</button></div></div><form method="post" action="/logout"><button title="退出">↪</button></form></div>
@@ -122,6 +123,7 @@
       </div>
       <form id="rackRequestForm" class="card form-grid rack-request-form">
         <label>序列号 *<input name="序列号" required></label>
+        <label>请求类型 *<select name="请求类型" required><option>上架</option><option>下架</option><option>变更</option></select></label>
         <label>品牌<input name="品牌"></label>
         <label>型号<input name="型号"></label>
         <label>CPU型号<input name="CPU型号"></label>
@@ -129,15 +131,14 @@
         <label>服务器成本(万)<input name="服务器成本(万)"></label>
         <label>资源申请编号<input name="资源申请编号"></label>
         <label>是否液冷<input name="是否液冷"></label>
-        <label>是否上架 *<select name="是否上架"><option>是</option><option>否</option></select></label>
         <label>是否重装系统 *<select name="是否重装系统" required><option>是</option><option>否</option></select></label>
         <label>初始密码<input name="初始密码"></label>
         <label>客户id *<input name="客户id" list="customerIdOptions" data-customer-id required></label>
         <label>客户名称<input name="客户名称" list="customerNameOptions" data-customer-name></label>
         <label>所在机房 *<input name="所在机房" required></label>
-        <label class="wide">防火墙白名单<textarea name="防火墙白名单"></textarea></label>
-        <label class="wide">上下架需求<textarea name="上下架需求"></textarea></label>
-        <label class="wide">备注<textarea name="备注"></textarea></label>
+        <div id="rackTagFields" class="wide rack-tag-fields"></div>
+        <label>防火墙白名单<textarea name="防火墙白名单"></textarea></label>
+        <label>备注<textarea name="备注"></textarea></label>
         <div class="wide attachment-form-row">
           <div class="attachment-head"><b>附件资料</b><span class="muted">可多选，随请求一并上传；提交后可在下方请求卡片里继续添加 / 重命名 / 删除</span></div>
           <input id="rackRequestFiles" type="file" multiple>
@@ -157,6 +158,12 @@
       </div>
       <div class="table-meta no-border"><b id="rackRequestListTitle">我的待审核请求</b><span id="rackRequestListHint">仅展示当前用户提交且尚未进入审批流的请求</span></div>
       <div id="rackRequestList" class="review-list"></div>
+    </section>
+
+    <section id="trash" class="page">
+      <div class="hero"><div><h2>回收站</h2><p>下架实施完成后，服务器整行暂存在这里。可以修改客户 / 机位后重新上架，或永久删除。</p></div><div class="hero-note"><b>仅管理人员</b><span>永久删除会连带清理该序列号的资料附件</span></div></div>
+      <div class="table-meta no-border"><b>已下架服务器</b><span id="trashListHint">重新上架前会按机柜表校验客户、机位与 IP 占用；冲突时请先补登客户或腾出机位</span></div>
+      <div id="trashList" class="review-list"></div>
     </section>
 
     <section id="settings" class="page">
@@ -194,5 +201,5 @@
     window.APP_USER={{ app_user|tojson }};
     window.APP_CAPABILITIES={{ capabilities|tojson }};
   </script>
-  <script src="{{ url_for('static', filename='app.js') }}"></script>
+  <script src="{{ url_for('static', filename='app.js') }}?v={{ asset_version }}"></script>
 </body></html>

@@ -19,6 +19,7 @@ from .core import (
     RACK_REQUEST_HEADERS,
     RACK_REQUEST_EXPORT_HEADERS,
     RACK_REQUEST_META,
+    REQUEST_TYPES,
     TAG_MAX_COUNT,
     TAG_MAX_LENGTH,
     TAG_MAX_OPTIONS,
@@ -34,6 +35,7 @@ from .core import (
     multi_value_fields,
     normalize_entity,
     normalize_rack_request_header,
+    normalize_rack_request_value,
     normalize_row,
     normalize_tag,
     now_text,
@@ -1242,23 +1244,25 @@ def approve_slot_swap(change, conn):
 
 
 def normalize_rack_request(row):
+    """请求数据归一：字段白名单化 + 多值标签统一分隔符。
+
+    请求类型缺省按「上架」处理；下架/变更针对已有服务器，客户与机房缺省用正式
+    记录补齐（表单上仍可改，校验时会按请求类型分别约束）。
+    """
     canonical = {}
     for key, value in (row or {}).items():
         target = normalize_rack_request_header(key)
         if target in RACK_REQUEST_HEADERS:
             canonical[target] = value
-    data = {field: clean_value(canonical.get(field, "")) for field in RACK_REQUEST_HEADERS}
-    if not data["是否上架"]:
-        data["是否上架"] = "是"
-    if data["是否上架"] == "否" and data["序列号"]:
-        server = next((row for row in read_records("servers") if row["序列号"] == data["序列号"]), None)
+    data = {field: normalize_rack_request_value(field, canonical.get(field, "")) for field in RACK_REQUEST_HEADERS}
+    if not data["请求类型"]:
+        data["请求类型"] = "上架"
+    if data["请求类型"] in {"下架", "变更"} and data["序列号"]:
+        server = next((item for item in read_records("servers") if item["序列号"] == data["序列号"]), None)
         if server:
-            if not data["客户id"]:
-                data["客户id"] = server.get("客户id", "")
-            if not data["客户名称"]:
-                data["客户名称"] = server.get("客户名称", "")
-            if not data["所在机房"]:
-                data["所在机房"] = server.get("所在机房", "")
+            for field in ("客户id", "客户名称", "所在机房"):
+                if not data[field]:
+                    data[field] = clean_value(server.get(field, ""))
     if data["客户id"]:
         data = apply_customer_name(data)
     return data
@@ -1266,10 +1270,11 @@ def normalize_rack_request(row):
 
 def validate_rack_request(data):
     errors = []
+    request_type = data["请求类型"]
     if not data["序列号"]:
         errors.append("序列号不能为空")
-    if data["是否上架"] not in {"是", "否"}:
-        errors.append("是否上架必须是 是 或 否")
+    if request_type not in REQUEST_TYPES:
+        errors.append(f"请求类型必须是 {'、'.join(REQUEST_TYPES)} 之一")
     if not data["是否重装系统"]:
         errors.append("是否重装系统不能为空")
     elif data["是否重装系统"] not in {"是", "否"}:
@@ -1279,26 +1284,36 @@ def validate_rack_request(data):
     servers = read_records("servers")
     server_by_serial = {row["序列号"]: row for row in servers}
     existing_server = server_by_serial.get(data["序列号"])
-    if data["是否上架"] == "否" and existing_server:
-        if data["客户id"] != existing_server.get("客户id", ""):
-            errors.append(f"客户id必须与服务器 {data['序列号']} 的客户id {existing_server.get('客户id', '')} 一致")
-        if data["所在机房"] != existing_server.get("所在机房", ""):
-            errors.append(f"所在机房必须与服务器 {data['序列号']} 的所在机房 {existing_server.get('所在机房', '')} 一致")
-    else:
-        customer_ids = {row["客户id"] for row in read_records("customers")}
+    customer_ids = {row["客户id"] for row in read_records("customers")}
+    room_names = {row["机房"] for row in read_records("cabinets") if row["机房"]}
+    if request_type == "上架":
+        if existing_server:
+            errors.append(f"序列号 {data['序列号']} 已存在；要修改已有服务器请提交「变更」请求")
         if not data["客户id"]:
             errors.append("客户id不能为空")
         elif data["客户id"] not in customer_ids:
             errors.append(f"客户id {data['客户id']} 不存在")
-        room_names = {row["机房"] for row in read_records("cabinets") if row["机房"]}
         if not data["所在机房"]:
             errors.append("所在机房不能为空")
         elif data["所在机房"] not in room_names:
             errors.append(f"所在机房 {data['所在机房']} 不存在")
-    if data["是否上架"] == "是" and existing_server:
-        errors.append(f"序列号 {data['序列号']} 已存在")
-    if data["是否上架"] == "否" and not existing_server:
-        errors.append(f"序列号 {data['序列号']} 不存在")
+        return errors
+    # 下架 / 变更：必须指向一条现存服务器记录
+    if not existing_server:
+        errors.append(f"序列号 {data['序列号']} 不存在，无法提交{request_type}请求")
+        return errors
+    if request_type == "下架":
+        # 下架不允许顺手改客户/机房，避免误改台账
+        if data["客户id"] != clean_value(existing_server.get("客户id", "")):
+            errors.append(f"客户id必须与服务器 {data['序列号']} 的客户id {existing_server.get('客户id', '')} 一致")
+        if data["所在机房"] != clean_value(existing_server.get("所在机房", "")):
+            errors.append(f"所在机房必须与服务器 {data['序列号']} 的所在机房 {existing_server.get('所在机房', '')} 一致")
+    else:
+        # 变更：客户与机房允许改，但必须已登记
+        if data["客户id"] and data["客户id"] not in customer_ids:
+            errors.append(f"客户id {data['客户id']} 不存在")
+        if data["所在机房"] and data["所在机房"] not in room_names:
+            errors.append(f"所在机房 {data['所在机房']} 不存在")
     return errors
 
 
@@ -1326,7 +1341,7 @@ def importable_rack_request_duplicate(conn, serial_number):
 
 def insert_rack_request(conn, data, user, submitted_at=None):
     request_id = uuid.uuid4().hex[:12]
-    request_type = "上架" if data["是否上架"] == "是" else "下架"
+    request_type = data["请求类型"]
     stage = initial_rack_request_stage(request_type)
     submitted_at = submitted_at or now_text()
     conn.execute("""INSERT INTO rack_requests
@@ -1349,7 +1364,7 @@ def insert_rack_request(conn, data, user, submitted_at=None):
 
 
 def overwrite_rack_request(conn, row, data, user, submitted_at=None):
-    request_type = "上架" if data["是否上架"] == "是" else "下架"
+    request_type = data["请求类型"]
     stage = initial_rack_request_stage(request_type)
     submitted_at = submitted_at or now_text()
     conn.execute(
@@ -1408,6 +1423,11 @@ def rack_request_rows_from_upload(uploaded):
 def rack_request_to_json(row):
     data = json.loads(row["request_data"])
     stage_data = parse_json_dict(row["stage_data"] if "stage_data" in row.keys() else "{}")
+    base_data = {}
+    if row["request_type"] == "变更":
+        # 变更的实施表单要以现行服务器记录为底（请求里只有部分字段）
+        serial = clean_value(row["serial_number"])
+        base_data = next((item for item in read_records("servers") if item["序列号"] == serial), {})
     item = dict(data)
     item.update({
         "id": row["id"],
@@ -1421,6 +1441,7 @@ def rack_request_to_json(row):
         "reviewed_at": row["reviewed_at"],
         "reject_reason": row["reject_reason"],
         "request_data": data,
+        "base_data": base_data,
     })
     return item
 
@@ -1449,23 +1470,30 @@ def rack_request_rack_date(row):
     return date_text(submitted_at, today_text())
 
 
-def rack_server_draft(row, override=None):
+def rack_server_draft(row, override=None, base=None):
+    """请求 → 服务器记录草稿。
+
+    base 用于「变更」请求：以现行服务器记录为底，请求里留空的字段不会把已有值冲掉；
+    override 是表单提交值，允许显式清空（原样覆盖）。
+    """
     data = parse_json_dict(row["request_data"])
     stage_data = parse_json_dict(row["stage_data"] if "stage_data" in row.keys() else "{}")
     override = override or {}
-    return normalize_row("servers", {
-        **data,
-        **stage_data,
-        **override,
-        "客户id": override.get("客户id") or stage_data.get("客户id") or data.get("客户id", ""),
-        "客户名称": override.get("客户名称") or stage_data.get("客户名称") or data.get("客户名称", ""),
-        "所在机房": override.get("所在机房") or stage_data.get("所在机房") or data.get("所在机房", ""),
+    draft = dict(base or {})
+    for source in (data, stage_data):
+        draft.update({key: value for key, value in source.items() if clean_value(value)})
+    draft.update(override)
+    draft.update({
+        "客户id": override.get("客户id") or stage_data.get("客户id") or data.get("客户id", "") or draft.get("客户id", ""),
+        "客户名称": override.get("客户名称") or stage_data.get("客户名称") or data.get("客户名称", "") or draft.get("客户名称", ""),
+        "所在机房": override.get("所在机房") or stage_data.get("所在机房") or data.get("所在机房", "") or draft.get("所在机房", ""),
         # 分配/实施表单里手动填了上架时间就用它，否则回落到请求提交日期（不允许留空）
         "上架时间": date_text(
-            override.get("上架时间") or stage_data.get("上架时间"),
+            override.get("上架时间") or stage_data.get("上架时间") or draft.get("上架时间"),
             rack_request_rack_date(row),
         ),
     })
+    return normalize_row("servers", draft)
 
 
 def implementation_slot_conflict_errors(server_data, request_id=""):
@@ -1509,25 +1537,42 @@ def notify_rack_stage(conn, row, event_type, title, reviewer, server_data=None):
 
 
 def complete_rack_request(conn, row, user, server_data=None):
+    """具体实施收尾：按请求类型新增 / 更新 / 移入回收站。"""
     records = read_records("servers")
-    operation = "新增" if row["request_type"] == "上架" else "删除"
+    request_type = row["request_type"]
     key = row["serial_number"]
     event_server_data = server_data or {}
-    if operation == "新增":
+    operation = {"上架": "新增", "变更": "更新"}.get(request_type, "删除")
+    final_serial = key
+    if request_type == "上架":
         normalized, errors = validate_record("servers", server_data or {}, records)
-        key = record_key(ENTITIES["servers"], normalized)
         if errors:
             return None, errors
         event_server_data = normalized
+        final_serial = record_key(ENTITIES["servers"], normalized)
         records.append(normalized)
+        write_records("servers", records)
+    elif request_type == "变更":
+        current = next((item for item in records if item["序列号"] == key), None)
+        if not current:
+            return None, ["服务器记录不存在"]
+        current_key = record_key(ENTITIES["servers"], current)
+        merged = rack_server_draft(row, server_data, base=current)
+        merged["序列号"] = key  # 序列号是定位键，变更不允许改
+        normalized, errors = validate_record("servers", merged, exclude_record_key=current_key)
+        if errors:
+            return None, errors
+        event_server_data = normalized
+        records = [normalized if item["序列号"] == key else item for item in records]
+        write_records("servers", records)
     else:
         current = next((item for item in records if item["序列号"] == key), None)
         if not current:
             return None, ["服务器记录不存在"]
         event_server_data = current
         records = [record for record in records if record["序列号"] != key]
-    write_records("servers", records)
-    final_serial = normalized["序列号"] if operation == "新增" else key
+        write_records("servers", records)
+        move_server_to_trash(conn, current, request_id=row["id"], deleted_by=user["用户id"], reason="下架实施完成")
     version_code = storage.create_version_record(conn, row["id"], "servers", operation, final_serial, user["用户id"])
     reviewed_at = now_text()
     conn.execute("""UPDATE rack_requests
@@ -1540,7 +1585,114 @@ def complete_rack_request(conn, row, user, server_data=None):
     event_row = dict(row)
     event_row["reviewed_at"] = reviewed_at
     notify_rack_stage(conn, event_row, "approved", "服务器上下架具体实施已完成", user["用户id"], event_server_data)
-    return f"服务器上下架具体实施已完成，已生成版本 {version_code}", []
+    return f"服务器{request_type}具体实施已完成，已生成版本 {version_code}", []
+
+
+# ---------------------------------------------------------------- 回收站
+# 下架实施完成时把服务器整行快照存进 trash 表，服务器表随即删掉该行。
+# 只有管理人员能查看 / 重新上架 / 永久删除；永久删除会连带清掉该序列号的资料附件。
+
+RESTORE_EDITABLE_FIELDS = ("客户id", "客户名称", "所在机房", "所属机柜", "所属机位", "备注")
+
+
+def move_server_to_trash(conn, server, request_id="", deleted_by="", reason=""):
+    trash_id = uuid.uuid4().hex[:12]
+    conn.execute(
+        "INSERT INTO trash (id,serial_number,data,request_id,deleted_at,deleted_by,reason) VALUES (?,?,?,?,?,?,?)",
+        (
+            trash_id, clean_value(server.get("序列号")), json.dumps(server, ensure_ascii=False),
+            request_id, now_text(), deleted_by, reason,
+        ),
+    )
+    return trash_id
+
+
+def trash_rows():
+    with db() as conn:
+        rows = conn.execute("SELECT * FROM trash ORDER BY deleted_at DESC, rowid DESC").fetchall()
+    return [dict(row) for row in rows]
+
+
+def trash_to_json(row):
+    item = parse_json_dict(row["data"])
+    item.update({
+        "id": row["id"],
+        "serial_number": row["serial_number"],
+        "request_id": row["request_id"],
+        "deleted_at": row["deleted_at"],
+        "deleted_by": row["deleted_by"],
+        "reason": row["reason"],
+    })
+    return item
+
+
+def restore_trash(trash_id, overrides=None, actor=""):
+    """重新上架：把快照写回服务器表。
+
+    允许顺便改客户与机位（overrides），校验不过就整单拒绝——冲突时由管理人员先
+    补登客户 / 腾出机位，再回来恢复，不做静默降级。
+    """
+    overrides = overrides or {}
+    with db() as conn:
+        row = conn.execute("SELECT * FROM trash WHERE id=?", (trash_id,)).fetchone()
+    if not row:
+        raise ValueError("回收站记录不存在")
+    serial = clean_value(row["serial_number"])
+    records = read_records("servers")
+    if any(item["序列号"] == serial for item in records):
+        raise ValueError(f"序列号 {serial} 已在服务器表中，不能重复恢复")
+    snapshot = parse_json_dict(row["data"])
+    merged = normalize_row("servers", {**snapshot, **{k: v for k, v in overrides.items() if k in snapshot or k in RESTORE_EDITABLE_FIELDS}})
+    merged["序列号"] = serial
+    normalized, errors = validate_record("servers", merged)
+    if errors:
+        raise ValueError("；".join(errors))
+    records.append(normalized)
+    write_records("servers", records)
+    with db() as conn:
+        conn.execute("DELETE FROM trash WHERE id=?", (trash_id,))
+        notify_audit_event(conn, {
+            "event_type": "restored",
+            "audit_type": "回收站",
+            "title": "服务器已从回收站重新上架",
+            "entity_label": "服务器",
+            "operation": "重新上架",
+            "record_key": serial,
+            "reviewer": actor,
+            "time": now_text(),
+            "summary": summarize_record(normalized, ["序列号", "客户名称", "所在机房", "所属机柜", "所属机位"]),
+        })
+    return normalized
+
+
+def purge_trash(trash_id, actor=""):
+    """永久删除：回收站记录 + 该序列号的全部资料附件（含磁盘文件）。"""
+    with db() as conn:
+        row = conn.execute("SELECT * FROM trash WHERE id=?", (trash_id,)).fetchone()
+    if not row:
+        raise ValueError("回收站记录不存在")
+    serial = clean_value(row["serial_number"])
+    with db() as conn:
+        attachments = conn.execute("SELECT * FROM attachments WHERE serial_number=?", (serial,)).fetchall()
+    removed = 0
+    for attachment in attachments:
+        if storage.delete_attachment_file(attachment["stored_name"]):
+            removed += 1
+    with db() as conn:
+        conn.execute("DELETE FROM attachments WHERE serial_number=?", (serial,))
+        conn.execute("DELETE FROM trash WHERE id=?", (trash_id,))
+        notify_audit_event(conn, {
+            "event_type": "purged",
+            "audit_type": "回收站",
+            "title": "服务器已从回收站永久删除",
+            "entity_label": "服务器",
+            "operation": "永久删除",
+            "record_key": serial,
+            "reviewer": actor,
+            "time": now_text(),
+            "summary": f"连带删除资料 {len(attachments)} 个",
+        })
+    return {"serial_number": serial, "attachments": len(attachments), "deleted": removed}
 
 
 # ---------------------------------------------------------------- 服务器资料（附件）

@@ -104,7 +104,7 @@ TOOL_SPECS = [
         "description": (
             "列出上下架请求（只给摘要：id/状态/阶段/序列号/客户/提交人/时间）。"
             "上架请求的阶段是 allocation（机位IP分配）→ implementation（具体实施），"
-            "下架请求直接进 implementation，驳回后 stage=rejected。看完整请求内容用 sm_rack_get。"
+            "下架 / 变更请求直接进 implementation，驳回后 stage=rejected。看完整请求内容用 sm_rack_get。"
         ),
         "inputSchema": {
             "type": "object",
@@ -252,9 +252,11 @@ TOOL_SPECS = [
     {
         "name": "sm_rack_submit",
         "description": (
-            "提交服务器上下架请求（进入 allocation 机位IP分配 → implementation 具体实施两段流程）。"
-            "上架请求必须带齐上下架请求表头字段（序列号、是否上架、客户id 等，见 sm_schema 的 rack_headers）。"
-            "同一序列号已有待审核请求会被拒绝。"
+            "提交服务器上下架请求。row 里的「请求类型」决定流程："
+            "上架 → allocation 机位IP分配 → implementation 具体实施（新增服务器记录）；"
+            "下架 / 变更 → 直接进 implementation（下架完成后服务器整行移入回收站，变更完成后直接写正式表）。"
+            "字段见 sm_schema 的 rack_headers（序列号、请求类型、客户id 等）；"
+            "上架要求序列号不在服务器表里，下架/变更要求序列号已存在。同一序列号已有待审核请求会被拒绝。"
         ),
         "inputSchema": {
             "type": "object",
@@ -271,7 +273,7 @@ TOOL_SPECS = [
         "description": (
             "审核上下架请求（管理人员全量 / 机房人员限本机房）。"
             "**stage 必须与请求的真实阶段一致**：工具会先查该请求的真实 stage，不一致直接中止且不产生任何变更。"
-            "分配阶段（allocation）通过时要给 server_data（机位/IP）；实施阶段（implementation）上架请求也可带 server_data 调整。"
+            "分配阶段（allocation）通过时要给 server_data（机位/IP）；实施阶段（implementation）上架与变更请求也可带 server_data 调整（变更以现有记录为底合并）。"
             "驳回必须给 reason。"
         ),
         "inputSchema": {
@@ -852,10 +854,18 @@ def _review(client, args):
     })
 
 
+RACK_SUBMIT_NEXT = {
+    "上架": "请求已提交，等待机位IP分配（allocation）审核；用 sm_rack_get 查看进度。",
+    "下架": "请求已提交，直接进入具体实施（implementation）；完成后服务器整行移入回收站。",
+    "变更": "请求已提交，直接进入具体实施（implementation）；完成后直接写入服务器正式表。",
+}
+
+
 def _rack_submit(client, args):
     row = args.get("row")
     if not isinstance(row, dict) or not row:
         raise SMError("row 不能为空（上下架请求字段，表头见 sm_schema 的 rack_headers）")
+    request_type = str(row.get("请求类型") or "").strip() or "上架"
 
     def run():
         result = client.json("/api/rack-requests", method="POST", payload=row)
@@ -863,7 +873,7 @@ def _rack_submit(client, args):
             "submitted": True,
             "request_id": result.get("request_id", ""),
             "message": result.get("message", ""),
-            "next": "请求已提交，等待机位IP分配（allocation）审核；用 sm_rack_get 查看进度。",
+            "next": RACK_SUBMIT_NEXT.get(request_type, RACK_SUBMIT_NEXT["上架"]),
         })
 
     return _idempotent("sm_rack_submit", args, run)

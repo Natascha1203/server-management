@@ -168,3 +168,73 @@ mark{background:#ffe9a8;color:inherit;padding:0 2px;border-radius:3px}
 /* 表格里的多值标签允许换行（其他单元格仍单行省略） */
 #dataBody td.cell-tags-cell{white-space:normal;max-width:300px}
 .cell-tags{display:inline-flex;flex-wrap:wrap;gap:4px;max-height:76px;overflow:hidden}
+
+/* 上下架请求表单里的标签字段（由 JS 注入，占满一行） */
+.rack-tag-fields{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:12px}
+.rack-tag-field{display:flex;flex-direction:column;gap:6px;font-size:12px;color:#526671}
+.rack-tag-field .tag-field{min-height:42px}
+
+/* 回收站：重新上架表单 */
+.trash-restore-form{margin-top:12px;padding-top:12px;border-top:1px dashed var(--line)}
+.trash-restore-form .review-actions{grid-column:1/-1}
+.trash-restore-form label{font-size:12px;color:#526671}
+
+/* ---------------------------------------------------------------- 表单卡片：留白与网格
+   .card 自身不带内边距，表单直接当卡片用会贴边；这里统一给卡片内表单留白 */
+.card.form-grid{padding:20px 22px 18px}
+/* .wide 之前只有 .rack-approval-form 作用域内有定义，主表单一直没跨列，补上 */
+.form-grid .wide{grid-column:1/-1}
+.form-grid input[type=checkbox]{width:16px;height:16px;min-height:0;padding:0;align-self:flex-start;margin-top:2px;accent-color:#148f83}
+/* 表单里的多行文本框与输入框对齐 */
+.form-grid textarea{font:inherit;color:var(--text)}
+/* 卡片底部的说明文字不要贴住边框 */
+.table-card.card>p.muted{padding:0 20px 16px;margin:0}
+#fieldOptionsPanels+.muted{margin-top:0}
+/* 请求页顶部模板/导入按钮与上方 hero、下方表单拉开距离 */
+.table-actions{display:flex;flex-wrap:wrap;gap:9px;margin:18px 0 0}
+
+/* ---------------------------------------------------------------- 下拉框统一外观
+   原生 select 在 Windows 上是黑边+系统箭头，与输入框风格不统一；改为自绘箭头 */
+.form-grid select,
+.rack-approval-form select,
+.server-location select,
+.state-select select,
+.filter-row select,
+.sort-row select,
+.trash-restore-form select{
+  -webkit-appearance:none;-moz-appearance:none;appearance:none;
+  width:100%;
+  border:1px solid #d9e2e8;border-radius:8px;
+  background-color:#fff;
+  background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='8' viewBox='0 0 12 8'%3E%3Cpath d='M1 1.6 6 6.4 11 1.6' fill='none' stroke='%236f7f8c' stroke-width='1.6' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
+  background-repeat:no-repeat;
+  background-position:right 12px center;
+  color:var(--text);
+  font-size:13px;
+  line-height:1.45;
+  padding:10px 34px 10px 10px;
+  outline:none;
+  cursor:pointer;
+  text-overflow:ellipsis;
+  transition:border-color .15s ease,box-shadow .15s ease;
+}
+.form-grid select:hover,
+.rack-approval-form select:hover,
+.server-location select:hover,
+.state-select select:hover,
+.filter-row select:hover,
+.sort-row select:hover,
+.trash-restore-form select:hover{border-color:#c3d4dd}
+.form-grid select:focus,
+.rack-approval-form select:focus,
+.server-location select:focus,
+.state-select select:focus,
+.filter-row select:focus,
+.sort-row select:focus,
+.trash-restore-form select:focus{border-color:#28a99b;box-shadow:0 0 0 3px rgba(40,169,155,.1)}
+.form-grid select:disabled{background-color:#eef3f6;color:#7b8b96;cursor:not-allowed}
+@media(max-width:900px){.card.form-grid{padding:16px}}
+
+/* 表格卡片内的操作行 / 标签面板同样留出与边框的距离 */
+.table-card.card>.modal-actions{margin-top:0;padding:16px 20px 18px}
+.tag-admin-grid{padding:14px 20px 0}

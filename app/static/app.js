@@ -2,7 +2,7 @@ const APP_CAPABILITIES = window.APP_CAPABILITIES || [];
 const APP_USER = window.APP_USER || {};
 const SERVER_APPROVAL_HEADERS = ['序列号', '品牌', '型号', 'CPU型号', '网卡', '服务器成本(万)', '归属单位', '用途分类', '用途', '防火墙白名单', '资源申请编号', '是否液冷', '客户id', '客户名称', '所在机房', '所属机柜', '所属机位', '管理ip', '交易ip', '带外ip', '管理密码', '带外密码', '上架时间', '接入行情', '接入柜台', '备注'];
 const RACK_REVIEW_FILTER_FIELDS = ['序列号', '客户id', '客户名称', '所在机房'];
-const state = { entity: 'cabinets', records: [], meta: null, editing: null, pendingEditing: null, rackEditing: null, rackRequestStatus: 'pending', status: 'pending', reviewMode: 'allocation', stats: null, filters: [], sorts: [], reviewFilters: [], rackRequestFilters: [], changes: [], rackRequests: [], rackApprovalOptions: { rooms: [] }, rackSlotPick: {}, rackRequestExpanded: [], rackReviewExpanded: [], systemUsers: [], customerOptions: [], fieldOptions: {}, fieldOptionsAdmin: null, attachmentMap: {}, attachmentCounts: {}, attachmentModalSerial: '' };
+const state = { entity: 'cabinets', records: [], meta: null, editing: null, pendingEditing: null, rackEditing: null, rackRequestStatus: 'pending', status: 'pending', reviewMode: 'allocation', stats: null, filters: [], sorts: [], reviewFilters: [], rackRequestFilters: [], changes: [], rackRequests: [], rackApprovalOptions: { rooms: [] }, rackSlotPick: {}, rackRequestExpanded: [], rackReviewExpanded: [], systemUsers: [], customerOptions: [], fieldOptions: {}, fieldOptionsAdmin: null, attachmentMap: {}, attachmentCounts: {}, attachmentModalSerial: '', trash: [], trashExpanded: [] };
 const $ = s => document.querySelector(s);
 const $$ = s => [...document.querySelectorAll(s)];
 
@@ -112,7 +112,7 @@ function fieldLabelClass(field) {
 /* ==== 多值标签字段（接入行情 / 接入柜台）====
    存库仍是 "A, B" 文本，保证 Excel 可读、导入导出、审批 new_data 都不用改；
    控件只是把它拆成可勾选的标签块，候选池由管理人员在设置页维护。 */
-const TAG_FIELDS = ['接入行情', '接入柜台'];
+const TAG_FIELDS = ['用途分类', '接入行情', '接入柜台'];
 const TAG_SPLIT_RE = /[,，、;；\r\n]+/;
 
 function isTagField(field) {
@@ -385,7 +385,7 @@ function openPage(b) {
   $$('.nav-item').forEach(x => x.classList.toggle('active', x === b || (p === 'review' && x.dataset.page === 'review')));
   $$('.nav-sub-item').forEach(x => x.classList.toggle('active', x === b));
   $$('.page').forEach(x => x.classList.toggle('active', x.id === p));
-  $('#pageTitle').textContent = { maintenance: '信息维护', review: '审核管理', statistics: '机柜统计', rackRequests: '上下架请求', settings: '设置' }[p];
+  $('#pageTitle').textContent = { maintenance: '信息维护', review: '审核管理', statistics: '机柜统计', rackRequests: '上下架请求', trash: '回收站', settings: '设置' }[p];
   if (p === 'review') {
     if (b.dataset.navReviewMode) {
       if (state.reviewMode !== b.dataset.navReviewMode) {
@@ -400,6 +400,7 @@ function openPage(b) {
   }
   if (p === 'statistics') loadStats();
   if (p === 'rackRequests') loadRackRequests();
+  if (p === 'trash') loadTrash();
   if (p === 'settings') {
     loadSettings();
     loadSystemUsers();
@@ -1640,40 +1641,51 @@ function todayDateText() {
 function serverDraftFromRackRequest(item) {
   const data = item.request_data || {};
   const stageData = item.stage_data || {};
+  // 变更请求以现行服务器记录为底（请求里只带部分字段，留空不代表清空）
+  const draft = { ...(item.base_data || {}) };
+  [data, stageData].forEach(source => {
+    Object.entries(source || {}).forEach(([key, value]) => {
+      if (String(value ?? '').trim()) draft[key] = value;
+    });
+  });
   // 上架时间：提交上下架请求时自动等于提交日期；分配/实施阶段改过就以改过的为准
   const submittedDate = toDateInputValue(item.submitted_at) || todayDateText();
   return {
-    ...data,
-    ...stageData,
-    '客户id': stageData['客户id'] || data['客户id'] || '',
-    '客户名称': stageData['客户名称'] || data['客户名称'] || '',
-    '所在机房': stageData['所在机房'] || data['所在机房'] || '',
-    '所属机柜': stageData['所属机柜'] || '',
-    '所属机位': stageData['所属机位'] || '',
-    '上架时间': toDateInputValue(stageData['上架时间']) || submittedDate,
+    ...draft,
+    '客户id': stageData['客户id'] || data['客户id'] || draft['客户id'] || '',
+    '客户名称': stageData['客户名称'] || data['客户名称'] || draft['客户名称'] || '',
+    '所在机房': stageData['所在机房'] || data['所在机房'] || draft['所在机房'] || '',
+    '所属机柜': stageData['所属机柜'] || draft['所属机柜'] || '',
+    '所属机位': stageData['所属机位'] || draft['所属机位'] || '',
+    '上架时间': toDateInputValue(stageData['上架时间']) || toDateInputValue(draft['上架时间']) || submittedDate,
   };
 }
 
 function roomCabinetsForRackRequest(item) {
-  const roomName = item.stage_data?.['所在机房'] || item['所在机房'] || item.request_data?.['所在机房'] || '';
+  const roomName = item.stage_data?.['所在机房'] || item['所在机房'] || item.request_data?.['所在机房'] || item.base_data?.['所在机房'] || '';
   const room = (state.rackApprovalOptions.rooms || []).find(x => x.name === roomName);
   return room?.cabinets || [];
 }
 
 function rackApprovalForm(item) {
-  if (item.status !== 'pending' || item.request_type !== '上架') return '';
+  // 上架：机位IP分配 → 具体实施；变更：直接进具体实施，表单以现行记录为底
+  if (item.status !== 'pending' || !['上架', '变更'].includes(item.request_type)) return '';
   const draft = serverDraftFromRackRequest(item);
   const textFields = SERVER_APPROVAL_HEADERS.filter(h => !['所在机房', '所属机柜', '所属机位'].includes(h));
   const cabinets = roomCabinetsForRackRequest(item);
   const cabinetOptions = cabinets.map(cabinet => `<option value="${esc(cabinet.name)}"${cabinet.name === draft['所属机柜'] ? ' selected' : ''}>${esc(cabinet.name)}</option>`).join('');
   const fields = textFields.map(field => {
-    const readonly = !isAdmin() && ['序列号', '客户id', '客户名称'].includes(field) ? ' readonly' : '';
+    // 变更请求按序列号定位，序列号不可改（后端也会强制保留原值）
+    const lockedForChange = item.request_type === '变更' && field === '序列号';
+    const readonly = lockedForChange || (!isAdmin() && ['序列号', '客户id', '客户名称'].includes(field)) ? ' readonly' : '';
     if (field === '客户id' || field === '客户名称') {
       return `<label>${esc(field)}${customerInput(field, draft[field] || '', readonly)}</label>`;
     }
     return `<label${fieldLabelClass(field)}>${esc(field)}${textFieldInput(field, draft[field] || '', readonly)}</label>`;
   }).join('');
-  const approveText = state.reviewMode === 'allocation' ? '完成服务器机位IP分配' : '完成具体实施';
+  const approveText = state.reviewMode === 'allocation'
+    ? '完成服务器机位IP分配'
+    : item.request_type === '变更' ? '完成变更并写入正式表' : '完成具体实施';
   const autoIpButton = state.reviewMode === 'allocation' ? '<button class="btn ghost" type="button" data-rack-auto-ip>自动分配 IP</button>' : '';
   const roomReadonly = !isAdmin() ? ' readonly' : '';
   const slotReadonly = !isAdmin() ? ' readonly' : '';
@@ -1815,7 +1827,7 @@ async function loadRackRequests() {
 
 async function autofillRackOffFields() {
   const form = $('#rackRequestForm');
-  if (!form || form.elements['是否上架']?.value !== '否') return;
+  if (!form || form.elements['请求类型']?.value === '上架') return;
   const serial = form.elements['序列号']?.value.trim();
   if (!serial) return;
   try {
@@ -1885,9 +1897,27 @@ async function importRackRequests(event) {
   }
 }
 
+// 请求表里的多值字段复用 servers 的候选池（接入行情 / 接入柜台语义一致）
+const RACK_TAG_FIELDS = ['接入行情', '接入柜台'];
+
+function renderRackTagFields() {
+  const box = $('#rackTagFields');
+  if (!box) return;
+  box.innerHTML = RACK_TAG_FIELDS
+    .map(field => `<label class="rack-tag-field">${esc(field)}${tagFieldHtml(field, '', false)}</label>`)
+    .join('');
+}
+
+function resetRackTagFields() {
+  const box = $('#rackTagFields');
+  if (!box) return;
+  RACK_TAG_FIELDS.forEach(field => setTags(box.querySelector(`[data-tag-field="${field}"]`), []));
+}
+
 function resetRackRequestForm() {
   const form = $('#rackRequestForm');
   if (form) form.reset();
+  resetRackTagFields();
   state.rackEditing = null;
   const submit = $('#rackRequestSubmitBtn');
   const cancel = $('#rackRequestCancelEditBtn');
@@ -1901,6 +1931,11 @@ function editRackRequest(id, encoded) {
   if (!form) return;
   state.rackEditing = id;
   Object.entries(data).forEach(([key, value]) => {
+    if (isTagField(key)) {
+      const box = form.querySelector(`[data-tag-field="${key}"]`);
+      if (box) setTags(box, splitTags(value));
+      return;
+    }
     const field = form.elements[key];
     if (field) field.value = value;
   });
@@ -1938,6 +1973,125 @@ async function reviewRackRequest(id, action) {
     const d = await api(`/api/rack-requests/${id}/review`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
     toast(d.message);
     await loadChanges();
+  } catch (e) {
+    toast(e.message, true);
+  }
+}
+
+/* ==== 回收站（仅管理人员）====
+   下架实施完成后服务器整行进回收站；重新上架时可顺手改客户与机位，
+   冲突（客户未登记 / 机位被占）由后端拦下，请管理员先补登或腾位再来。 */
+const TRASH_DETAIL_FIELDS = ['品牌', '型号', 'CPU型号', '网卡', '服务器成本(万)', '用途分类', '用途', '接入行情', '接入柜台', '管理ip', '交易ip', '带外ip', '上架时间', '备注'];
+const TRASH_RESTORE_FIELDS = [
+  ['客户id', '客户id'],
+  ['所在机房', '所在机房'],
+  ['所属机柜', '所属机柜'],
+  ['所属机位', '所属机位'],
+];
+
+function trashDetails(item) {
+  const details = Object.fromEntries(TRASH_DETAIL_FIELDS.map(field => [field, item[field] || '']).filter(([, value]) => String(value).trim()));
+  return pretty(details);
+}
+
+function trashCard(item) {
+  const serial = item.serial_number || item['序列号'] || '';
+  const customer = item['客户名称'] || item['客户id'] || '';
+  const location = [item['所在机房'], item['所属机柜'], item['所属机位']].filter(Boolean).join(' / ');
+  const expanded = state.trashExpanded.includes(item.id);
+  const inputs = TRASH_RESTORE_FIELDS.map(([label, field]) =>
+    `<label>${esc(label)}<input name="${esc(field)}" value="${esc(item[field] || '')}"></label>`).join('');
+  const head = `<div class="review-top rack-request-head" data-trash-expand-id="${esc(item.id)}" title="点击展开/收起"><strong>${esc(serial)}</strong><span class="muted">${esc(location || '未记录位置')}</span>${customer ? `<span class="muted">· ${esc(customer)}</span>` : ''}<span class="review-time">${esc(item.deleted_at || '')}${item.deleted_by ? ' · ' + esc(item.deleted_by) : ''}</span><span class="rack-caret">${expanded ? '▾' : '▸'}</span></div>`;
+  const body = `<div class="rack-request-body"${expanded ? '' : ' hidden'}>
+    <div class="diff compact"><div class="diff-box"><b>下架时记录</b>${trashDetails(item)}</div></div>
+    <div class="trash-restore-form form-grid" data-trash-restore="${esc(item.id)}">
+      ${inputs}
+      <div class="review-actions wide">
+        <button class="btn danger" type="button" data-trash-action="purge">永久删除</button>
+        <button class="btn primary" type="button" data-trash-action="restore">重新上架</button>
+      </div>
+    </div>
+    <p class="muted">重新上架会按机柜表校验客户、机位与 IP 占用；永久删除会连带清掉该序列号的资料附件，不可恢复。</p>
+  </div>`;
+  return `<article class="review-card rack-request-card">${head}${body}</article>`;
+}
+
+function renderTrash() {
+  const box = $('#trashList');
+  if (!box) return;
+  box.innerHTML = state.trash.length ? state.trash.map(trashCard).join('') : '<div class="card empty">回收站里没有服务器</div>';
+  bindTrashActions();
+  refreshTrashBadge();
+}
+
+function refreshTrashBadge() {
+  const badge = $('#trashBadge');
+  if (!badge) return;
+  const count = (state.trash || []).length;
+  badge.textContent = String(count);
+  badge.hidden = count === 0;
+}
+
+function bindTrashActions() {
+  $$('#trashList [data-trash-expand-id]').forEach(head => {
+    head.onclick = () => {
+      const id = head.dataset.trashExpandId;
+      const body = head.parentElement.querySelector('.rack-request-body');
+      const caret = head.querySelector('.rack-caret');
+      body.hidden = !body.hidden;
+      caret.textContent = body.hidden ? '▸' : '▾';
+      if (body.hidden) state.trashExpanded = state.trashExpanded.filter(x => x !== id);
+      else if (!state.trashExpanded.includes(id)) state.trashExpanded.push(id);
+    };
+  });
+  $$('#trashList [data-trash-action]').forEach(button => {
+    const id = button.closest('[data-trash-restore]')?.dataset.trashRestore;
+    if (!id) return;
+    button.onclick = () => button.dataset.trashAction === 'restore'
+      ? restoreTrashItem(id, button)
+      : purgeTrashItem(id);
+  });
+}
+
+async function loadTrash() {
+  if (!$('#trashList')) return;
+  try {
+    const d = await api('/api/trash');
+    state.trash = d.items || [];
+    renderTrash();
+  } catch (e) {
+    toast(e.message, true);
+  }
+}
+
+async function restoreTrashItem(id, button) {
+  const form = button.closest('[data-trash-restore]');
+  const serverData = form
+    ? Object.fromEntries([...form.querySelectorAll('input')].map(input => [input.name, input.value.trim()]))
+    : {};
+  try {
+    const d = await api(`/api/trash/${id}/restore`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ server_data: serverData }),
+    });
+    toast(d.message);
+    state.trashExpanded = state.trashExpanded.filter(x => x !== id);
+    await loadTrash();
+  } catch (e) {
+    toast(e.message, true);
+  }
+}
+
+async function purgeTrashItem(id) {
+  const item = (state.trash || []).find(row => row.id === id) || {};
+  const serial = item.serial_number || item['序列号'] || '';
+  if (!confirm(`永久删除序列号 ${serial}？\n该操作不可恢复，并会连带删除它的全部资料附件。`)) return;
+  try {
+    const d = await api(`/api/trash/${id}`, { method: 'DELETE' });
+    toast(d.message);
+    state.trashExpanded = state.trashExpanded.filter(x => x !== id);
+    await loadTrash();
   } catch (e) {
     toast(e.message, true);
   }
@@ -2791,10 +2945,11 @@ bindTagFields();
 loadFieldOptions();
 if ($('#rackRequestForm')) {
   const form = $('#rackRequestForm');
+  renderRackTagFields();
   loadCustomerOptions().then(() => bindCustomerInputs(form)).catch(e => toast(e.message, true));
   form.onsubmit = submitRackRequest;
   form.elements['序列号'].addEventListener('change', autofillRackOffFields);
-  form.elements['是否上架'].addEventListener('change', autofillRackOffFields);
+  form.elements['请求类型'].addEventListener('change', autofillRackOffFields);
 }
 if ($('#rackRequestImportInput')) $('#rackRequestImportInput').onchange = importRackRequests;
 if ($('#rackRequestCancelEditBtn')) $('#rackRequestCancelEditBtn').onclick = resetRackRequestForm;
@@ -2828,4 +2983,5 @@ if ($('#addSystemUserBtn')) $('#addSystemUserBtn').onclick = () => {
 if ($('#saveSystemUsersBtn')) $('#saveSystemUsersBtn').onclick = saveSystemUsers;
 applyCapabilityVisibility();
 loadEntity().catch(e => toast(e.message, true));
+if (isAdmin() && $('#trashBadge')) loadTrash().catch(() => {});
 if (APP_ROLE === 'admin') refreshBadge();

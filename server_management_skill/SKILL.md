@@ -26,7 +26,7 @@ agent_created: true
 
 完整字段清单、字段别名、全部接口参数与返回结构、校验规则、错误码、curl 示例 → 见 `references/api-reference.md`。
 
-> `servers` 的 `接入行情` / `接入柜台` 是**多值标签字段**：存 `A, B` 文本，写入时也接受数组。候选标签池见 `GET /api/field-options?entity=servers`，增删改仅管理人员（API 参考 2.7 节）。
+> `servers` 的 `用途分类` / `接入行情` / `接入柜台` 是**多值标签字段**：存 `A, B` 文本，写入时也接受数组，每个字段有独立候选池。候选池见 `GET /api/field-options?entity=servers`，增删改仅管理人员（API 参考 2.8 节）。
 
 ## 常见任务 → 操作步骤
 
@@ -37,11 +37,12 @@ agent_created: true
 5. **删除服务器**：`POST /api/servers/delete` → 管理人员直接生效；其他身份再审核。
 6. **批量导入**：`POST /api/servers/import`（multipart 文件，表头必须 27 列全，末列 `备注`）→ 管理人员直接生效；其他身份再审核。
 7. **查待审批申请**：`GET /api/changes?status=pending`。
-8. **提交上架请求**：`POST /api/rack-requests`。
-9. **审核上架（分配机位IP）**：`GET /api/rack-requests?stage=allocation` → `POST /api/rack-requests/<id>/review`（`approve` + `server_data`）。
+8. **提交上下架 / 变更请求**：`POST /api/rack-requests`，`请求类型` 取 `上架` / `下架` / `变更`。上架要求序列号不存在（走 机位IP分配 → 具体实施）；下架 / 变更要求序列号已存在，**直接进具体实施**（下架完成后服务器进回收站，变更完成后直接写正式表）。
+9. **审核上架（分配机位IP）**：`GET /api/rack-requests?stage=allocation` → `POST /api/rack-requests/<id>/review`（`approve` + `server_data`）。下架 / 变更只需一次 `approve`（stage 已是 `implementation`），变更的 `server_data` 会以现有记录为底合并。
 10. **交换机位**：`POST /api/servers/swap-slot`（Body 带 `old` / `new` / `target`）→ 我方服务器与目标机位占用者**互换位置**（占用者可为已实施/待审核/待实施三种载体）。对方的机位范围**以服务端判定为准**：`target.slot` 只需给被点击的单个机位，服务端会取出该占用者的完整机位范围（可能多行）整段对调，`new.所属机位` 会被覆盖。管理人员直接生效；其他身份提交后需 `review` 批准，两侧同时生效。
 11. **上传 / 查看 / 改删服务器资料（附件）**：`POST /api/attachments`（multipart，`serial` + 多个 `files`）→ `GET /api/attachments?serial=SN-1` 列表 → `GET /api/attachments/<id>/download` / `POST /api/attachments/<id>/rename` / `POST /api/attachments/<id>/delete`。资料按**序列号**归属，上下架请求、机位IP分配、具体实施、服务器表共用同一份；文件落在 `data/archive/<序列号>/`，**不进入任何 Excel 导出**。详见 `references/api-reference.md` 2.5 节。
-12. **维护接入行情 / 接入柜台（多值标签）**：写服务器时这两个字段可以传数组（如 `["CTP行情","Level-2"]`）或 `A, B` 文本，服务端会去重并按 `, ` 归一。读候选池 `GET /api/field-options?entity=servers`；**只有管理人员**能 `POST/PATCH/DELETE /api/field-options` 增删改。删除仍被记录或待审批引用的标签返回 `409`（只能改名，改名会级联刷新正式记录与待审批 `new_data`）。
+12. **维护用途分类 / 接入行情 / 接入柜台（多值标签）**：写服务器时这些字段可以传数组（如 `["CTP行情","Level-2"]`）或 `A, B` 文本，服务端会去重并按 `, ` 归一。读候选池 `GET /api/field-options?entity=servers`；**只有管理人员**能 `POST/PATCH/DELETE /api/field-options` 增删改。删除仍被记录或待审批引用的标签返回 `409`（只能改名，改名会级联刷新正式记录与待审批 `new_data`）。
+13. **回收站（仅管理人员）**：`GET /api/trash` 列已下架服务器快照 → `POST /api/trash/<id>/restore`（body 可带 `server_data` 改客户/机位）重新上架 → `DELETE /api/trash/<id>` 永久删除（连带清理该序列号的资料附件）。恢复会走完整服务器校验，冲突（客户未登记 / 机位被占 / 序列号已存在）返回 400 且保留回收站记录。详见 API 参考 2.6 节。
 
 ## 操作原则
 

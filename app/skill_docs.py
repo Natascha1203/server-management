@@ -37,7 +37,7 @@ ROLES = (ROLE_ADMIN, ROLE_ROOM, ROLE_BUSINESS)
 
 # schema 结构版本：仅当返回结构本身变化（增删顶层字段、改变字段语义）时递增。
 # 字段增删不需要动它——那由 ENTITIES 驱动，version 哈希会自动变。
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 # 文档名 → 候选文件名。只允许白名单，天然挡住 ../ 之类路径穿越。
 DOC_FILES = {
@@ -62,10 +62,12 @@ SCHEMA_RULES = [
     "`所属机位` 必须落在该机柜 `机位` 登记的范围内，且区间内每个机位都不能被其他服务器占用。",
     "`管理ip` / `交易ip` / `带外ip` 为 IPv4 或 CIDR；`管理ip网段` 等网段字段支持 `a.b.c.*`、`起-止`、CIDR。",
     "资产变更的生效方式由 token 对应身份决定：管理人员直接生效（`applied`），其他身份进入待审批（`pending` + `change_id`）。",
-    "上下架请求：`上架` 走 allocation（机位IP分配）→ implementation（具体实施）两段；`下架` 直接进 implementation；驳回时 stage 置为 rejected。",
+    "上下架请求按 `请求类型` 分流：`上架` 走 allocation（机位IP分配）→ implementation（具体实施）两段；`下架` / `变更` 直接进 implementation；驳回时 stage 置为 rejected。",
+    "`上架` 要求序列号不在服务器表；`下架` / `变更` 要求序列号已存在。下架实施完成后服务器整行进回收站；变更实施完成后以现有记录为底合并后直接写正式表（序列号不可改）。",
     "同一机位/IP 不允许被多个「待实施」请求同时占用（in-transit 槽位保护）。",
-    "资料（附件）按序列号归属，不进入任何 Excel/CSV 导出。",
-    "servers 的 `接入行情` / `接入柜台` 是多值标签字段：存 `A, B` 文本，写入时也接受数组，服务端会去重并按 `, ` 拼接；可用标签见 GET /api/field-options。",
+    "资料（附件）按序列号归属，不进入任何 Excel/CSV 导出；回收站永久删除会连带清理该序列号的资料。",
+    "servers 的 `用途分类` / `接入行情` / `接入柜台` 是多值标签字段：存 `A, B` 文本，写入时也接受数组，服务端会去重并按 `, ` 拼接；各字段候选池见 GET /api/field-options。",
+    "回收站接口仅管理人员可用：GET /api/trash、POST /api/trash/<id>/restore、DELETE /api/trash/<id>。",
 ]
 
 
