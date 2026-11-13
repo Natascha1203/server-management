@@ -86,7 +86,8 @@ TRASH_DDL = """CREATE TABLE IF NOT EXISTS trash (
     request_id TEXT NOT NULL DEFAULT '',
     deleted_at TEXT NOT NULL,
     deleted_by TEXT NOT NULL DEFAULT '',
-    reason TEXT NOT NULL DEFAULT ''
+    reason TEXT NOT NULL DEFAULT '',
+    origin TEXT NOT NULL DEFAULT ''
 )"""
 
 FIELD_OPTIONS_DDL = """CREATE TABLE IF NOT EXISTS field_options (

@@ -42,7 +42,7 @@ agent_created: true
 10. **交换机位**：`POST /api/servers/swap-slot`（Body 带 `old` / `new` / `target`）→ 我方服务器与目标机位占用者**互换位置**（占用者可为已实施/待审核/待实施三种载体）。对方的机位范围**以服务端判定为准**：`target.slot` 只需给被点击的单个机位，服务端会取出该占用者的完整机位范围（可能多行）整段对调，`new.所属机位` 会被覆盖。管理人员直接生效；其他身份提交后需 `review` 批准，两侧同时生效。
 11. **上传 / 查看 / 改删服务器资料（附件）**：`POST /api/attachments`（multipart，`serial` + 多个 `files`）→ `GET /api/attachments?serial=SN-1` 列表 → `GET /api/attachments/<id>/download` / `POST /api/attachments/<id>/rename` / `POST /api/attachments/<id>/delete`。资料按**序列号**归属，上下架请求、机位IP分配、具体实施、服务器表共用同一份；文件落在 `data/archive/<序列号>/`，**不进入任何 Excel 导出**。详见 `references/api-reference.md` 2.5 节。
 12. **维护用途分类 / 接入行情 / 接入柜台（多值标签）**：写服务器时这些字段可以传数组（如 `["CTP行情","Level-2"]`）或 `A, B` 文本，服务端会去重并按 `, ` 归一。读候选池 `GET /api/field-options?entity=servers`；**只有管理人员**能 `POST/PATCH/DELETE /api/field-options` 增删改。删除仍被记录或待审批引用的标签返回 `409`（只能改名，改名会级联刷新正式记录与待审批 `new_data`）。
-13. **回收站（仅管理人员）**：`GET /api/trash` 列已下架服务器快照 → `POST /api/trash/<id>/restore`（body 可带 `server_data` 改客户/机位）重新上架 → `DELETE /api/trash/<id>` 永久删除（连带清理该序列号的资料附件）。恢复会走完整服务器校验，冲突（客户未登记 / 机位被占 / 序列号已存在）返回 400 且保留回收站记录。详见 API 参考 2.6 节。
+13. **回收站（仅管理人员）**：`GET /api/trash` 列服务器快照 → `POST /api/trash/<id>/restore`（body 可带 `server_data` 改客户/机位）重新上架 → `DELETE /api/trash/<id>` 永久删除（连带清理该序列号的资料附件）；`POST /api/trash` 可**手动登记**一台只有序列号的服务器（`origin=manual`，信息等重新上架时再补）。**下架实施完成**、**直接 `delete` / `delete-batch` 删除服务器**、**手动登记**都会进回收站（`reason` 分别标「下架实施完成」/「删除操作（未走上下架流程）」/「手动登记（信息待补齐）」），所以误删可以用 `restore` 救回来；客户、机柜的删除不进回收站。恢复会走完整服务器校验，冲突（客户未登记 / 机位被占 / 序列号已存在）返回 400 且保留回收站记录；手动登记记录可以补齐任意服务器字段。详见 API 参考 2.6 节。
 
 ## 操作原则
 

@@ -1409,7 +1409,8 @@ def review_rack_request(request_id):
 
 
 # ---------------------------------------------------------------- 回收站
-# 下架实施完成后服务器整行进回收站；只有管理人员能看、能重新上架、能永久删除。
+# 服务器整行进回收站有三个入口：下架实施完成、页面删除/批量删除、回收站手动登记。
+# 只有管理人员能看、能手动登记、能重新上架、能永久删除。
 
 @bp.get("/api/trash")
 @require_login
@@ -1417,6 +1418,27 @@ def trash_api():
     if "manage_settings" not in capabilities_for(current_user()):
         return forbidden()
     return jsonify(items=[services.trash_to_json(row) for row in services.trash_rows()])
+
+
+@bp.post("/api/trash")
+@require_login
+def add_trash_api():
+    """手动登记一台服务器：序列号必填，其他字段可留空，重新上架时再补。"""
+    user = current_user()
+    if "manage_settings" not in capabilities_for(user):
+        return forbidden()
+    body = request.get_json(silent=True) or {}
+    serial = clean_value(body.get("序列号") or body.get("serial_number"))
+    extra = {
+        key: value for key, value in body.items()
+        if key in ENTITIES["servers"]["headers"] and key != "序列号"
+    }
+    try:
+        with storage.LOCK:
+            trash_id = services.add_manual_trash_server(serial, actor=user["用户id"], extra=extra)
+    except ValueError as exc:
+        return jsonify(error=str(exc)), 400
+    return jsonify(message=f"序列号 {serial} 已加入回收站，重新上架时再补齐信息", id=trash_id)
 
 
 @bp.post("/api/trash/<trash_id>/restore")

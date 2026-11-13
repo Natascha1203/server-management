@@ -69,7 +69,7 @@ Body: {"filters":[{"field":"序列号","pattern":"^SN-"}],
 
 **修改**：`POST /api/<entity>/update`，Body `{"old":{主键:旧值},"new":{...}}` → 需 old 定位原记录，new 为新值
 
-**删除**：`POST /api/<entity>/delete`，Body `{主键:值}`
+**删除**：`POST /api/<entity>/delete`，Body `{主键:值}` → 服务器（`servers`）删行前会把整行快照写进回收站，可从 2.6 恢复；客户 / 机柜不进回收站
 
 **批量删除**：`POST /api/<entity>/delete-batch`，Body `{"records":[{主键:值},...]}`
 
@@ -198,15 +198,27 @@ files=<file1> & files=<file2> ...   # 也接受 file 字段名
 
 ### 2.6 回收站（trash，仅管理人员）
 
-下架实施完成时，服务器整行快照写入 `trash` 表，服务器表删掉该行。**只有管理人员**能访问这三个接口（其他人 403）。
+三个入口会把记录写入 `trash` 表：
 
-**列表**：`GET /api/trash` → `{"items":[{id, serial_number, 序列号, 客户id, 客户名称, 所在机房, 所属机柜, 所属机位, ..., deleted_at, deleted_by, reason}]}`
-（快照字段直接摊平在对象顶层，与服务器记录同名字段一致）
+- **下架实施完成**（`reason=下架实施完成`，`request_id` 为上下架请求 id，`origin=""`），服务器表删掉该行
+- **`POST /api/servers/delete` / `delete-batch`**（`reason=删除操作（未走上下架流程）`，`request_id` 为变更 id，`origin=""`），服务器表删掉该行
+- **`POST /api/trash` 手动登记**（`reason=手动登记（信息待补齐）`，`origin="manual"`），只有序列号，服务器表不受影响
+
+**只有管理人员**能访问这些接口（其他人 403）。
+
+**手动登记**：`POST /api/trash`，Body `{"序列号":"SN-NEW"}`（其他服务器字段可选，不校验）
+- 序列号为空 → 400；序列号已在服务器表或已在回收站 → 400。
+- 返回 `{"message":"序列号 SN-NEW 已加入回收站，重新上架时再补齐信息","id":"<trash_id>"}`。
+- 手动登记只是占位，**不做**客户/机房/IP 校验；校验发生在重新上架时。
+
+**列表**：`GET /api/trash` → `{"items":[{id, serial_number, 序列号, 客户id, 客户名称, 所在机房, 所属机柜, 所属机位, ..., deleted_at, deleted_by, reason, origin}]}`
+（快照字段直接摊平在对象顶层，与服务器记录同名字段一致；`deleted_by` 记的是审批通过的人；`origin=manual` 表示手动登记的占位记录）
 
 **重新上架**：`POST /api/trash/<trash_id>/restore`，Body `{"server_data":{"客户id":"2","所属机位":"8-9"}}`
 - `server_data` 可省略；提供时覆盖快照里的同名字段（允许改客户与机位）。
+- **手动登记记录（origin=manual）允许补齐任意服务器字段**（品牌/型号/IP/用途…），因为它们本来就没有快照；普通快照仍只放开 `客户id / 客户名称 / 所在机房 / 所属机柜 / 所属机位 / 备注`。
 - 会走完整的服务器校验：客户必须已登记、机柜/机位必须在机柜表范围内、机位与 IP 不得被占用。
-- 冲突时返回 400 并说明原因（客户不存在 / 机位已被服务器 X 占用 / 序列号已存在），**回收站记录保留**。
+- 冲突时返回 400 并说明原因（客户不存在 / 机位已被服务器 X 占用 / 序列号已存在），**回收站记录保留**；手动登记记录缺必填字段时错误信息以「手动登记记录信息不完整：」开头。
 
 **永久删除**：`DELETE /api/trash/<trash_id>`
 - 连带删除该序列号的全部资料附件（`attachments` 行 + `data/archive/<序列号>/` 文件），不可恢复。

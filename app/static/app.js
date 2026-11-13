@@ -1268,7 +1268,10 @@ $('#recordForm').onsubmit = async e => {
 
 window.removeRow = async s => {
   const row = JSON.parse(decodeURIComponent(s));
-  const tip = APP_ROLE === 'admin' ? '确定删除该记录？将直接生效。' : '确定提交删除申请？审核通过后才会从正式 Excel 删除。';
+  const trashy = state.entity === 'servers';
+  const tip = APP_ROLE === 'admin'
+    ? (trashy ? '确定删除该服务器？将直接生效，整行记录会移入回收站（可恢复）。' : '确定删除该记录？将直接生效。')
+    : (trashy ? '确定提交删除申请？审核通过后服务器整行会移入回收站（可恢复）。' : '确定提交删除申请？审核通过后才会从正式 Excel 删除。');
   if (!confirm(tip)) return;
   try {
     const d = await api(`/api/${state.entity}/delete`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(row) });
@@ -1283,7 +1286,10 @@ window.removeRow = async s => {
 $('#bulkDeleteBtn').onclick = async () => {
   const rows = selectedRows();
   if (!rows.length) return;
-  const tip = APP_ROLE === 'admin' ? `确定删除 ${rows.length} 条记录？将直接生效。` : `确定提交 ${rows.length} 条删除申请？审核通过后才会从正式 Excel 删除。`;
+  const trashy = state.entity === 'servers';
+  const tip = APP_ROLE === 'admin'
+    ? (trashy ? `确定删除 ${rows.length} 条服务器记录？将直接生效，整行记录会移入回收站（可恢复）。` : `确定删除 ${rows.length} 条记录？将直接生效。`)
+    : (trashy ? `确定提交 ${rows.length} 条删除申请？审核通过后服务器整行会移入回收站（可恢复）。` : `确定提交 ${rows.length} 条删除申请？审核通过后才会从正式 Excel 删除。`);
   if (!confirm(tip)) return;
   try {
     const d = await api(`/api/${state.entity}/delete-batch`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ records: rows }) });
@@ -1979,8 +1985,9 @@ async function reviewRackRequest(id, action) {
 }
 
 /* ==== 回收站（仅管理人员）====
-   下架实施完成后服务器整行进回收站；重新上架时可顺手改客户与机位，
-   冲突（客户未登记 / 机位被占）由后端拦下，请管理员先补登或腾位再来。 */
+   下架 / 删除的服务器整行进回收站；重新上架时可顺手改客户与机位，
+   冲突（客户未登记 / 机位被占）由后端拦下，请管理员先补登或腾位再来。
+   也可以手动登记一台只有序列号的服务器（origin=manual），信息等重新上架时再补。 */
 const TRASH_DETAIL_FIELDS = ['品牌', '型号', 'CPU型号', '网卡', '服务器成本(万)', '用途分类', '用途', '接入行情', '接入柜台', '管理ip', '交易ip', '带外ip', '上架时间', '备注'];
 const TRASH_RESTORE_FIELDS = [
   ['客户id', '客户id'],
@@ -1998,12 +2005,17 @@ function trashCard(item) {
   const serial = item.serial_number || item['序列号'] || '';
   const customer = item['客户名称'] || item['客户id'] || '';
   const location = [item['所在机房'], item['所属机柜'], item['所属机位']].filter(Boolean).join(' / ');
+  const manual = item.origin === 'manual';
   const expanded = state.trashExpanded.includes(item.id);
   const inputs = TRASH_RESTORE_FIELDS.map(([label, field]) =>
     `<label>${esc(label)}<input name="${esc(field)}" value="${esc(item[field] || '')}"></label>`).join('');
-  const head = `<div class="review-top rack-request-head" data-trash-expand-id="${esc(item.id)}" title="点击展开/收起"><strong>${esc(serial)}</strong><span class="muted">${esc(location || '未记录位置')}</span>${customer ? `<span class="muted">· ${esc(customer)}</span>` : ''}<span class="review-time">${esc(item.deleted_at || '')}${item.deleted_by ? ' · ' + esc(item.deleted_by) : ''}</span><span class="rack-caret">${expanded ? '▾' : '▸'}</span></div>`;
+  const head = `<div class="review-top rack-request-head" data-trash-expand-id="${esc(item.id)}" title="点击展开/收起">${manual ? '<span class="tag">手动登记</span>' : ''}<strong>${esc(serial)}</strong><span class="muted">${esc(location || '未记录位置')}</span>${customer ? `<span class="muted">· ${esc(customer)}</span>` : ''}<span class="review-time">${esc(item.deleted_at || '')}${item.deleted_by ? ' · ' + esc(item.deleted_by) : ''}</span><span class="rack-caret">${expanded ? '▾' : '▸'}</span></div>`;
+  const recordBlock = manual
+    ? '<div class="diff compact"><div class="diff-box"><b>手动登记</b><p class="muted">这条记录只有序列号，补齐下面的客户与机位后再点「重新上架」。</p></div></div>'
+    : `<div class="diff compact"><div class="diff-box"><b>删除时记录</b>${trashDetails(item)}</div></div>`;
   const body = `<div class="rack-request-body"${expanded ? '' : ' hidden'}>
-    <div class="diff compact"><div class="diff-box"><b>下架时记录</b>${trashDetails(item)}</div></div>
+    ${recordBlock}
+    ${item.reason ? `<p class="muted">来源：${esc(item.reason)}</p>` : ''}
     <div class="trash-restore-form form-grid" data-trash-restore="${esc(item.id)}">
       ${inputs}
       <div class="review-actions wide">
@@ -2053,8 +2065,35 @@ function bindTrashActions() {
   });
 }
 
+function bindTrashAddForm() {
+  const form = $('#trashAddForm');
+  if (!form || form.dataset.bound) return;
+  form.dataset.bound = '1';
+  form.onsubmit = async event => {
+    event.preventDefault();
+    const serial = (form.querySelector('#trashAddSerial')?.value || '').trim();
+    if (!serial) {
+      toast('序列号不能为空', true);
+      return;
+    }
+    try {
+      const d = await api('/api/trash', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ 序列号: serial }),
+      });
+      toast(d.message);
+      form.reset();
+      await loadTrash();
+    } catch (e) {
+      toast(e.message, true);
+    }
+  };
+}
+
 async function loadTrash() {
   if (!$('#trashList')) return;
+  bindTrashAddForm();
   try {
     const d = await api('/api/trash');
     state.trash = d.items || [];

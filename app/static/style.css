@@ -178,6 +178,10 @@ mark{background:#ffe9a8;color:inherit;padding:0 2px;border-radius:3px}
 .trash-restore-form{margin-top:12px;padding-top:12px;border-top:1px dashed var(--line)}
 .trash-restore-form .review-actions{grid-column:1/-1}
 .trash-restore-form label{font-size:12px;color:#526671}
+/* 回收站：手动登记（只有序列号必填） */
+.trash-add-form{margin-top:16px}
+.trash-add-form .review-actions{grid-column:1/-1;justify-content:flex-start}
+.trash-add-form label{font-size:12px;color:#526671}
 
 /* ---------------------------------------------------------------- 表单卡片：留白与网格
    .card 自身不带内边距，表单直接当卡片用会贴边；这里统一给卡片内表单留白 */

@@ -4,7 +4,9 @@
 用法：
     python install_config.py --host workbuddy --base-url http://127.0.0.1:18888 --token xxx
     python install_config.py --host claude     --base-url https://sm.example.com --token xxx
-    python install_config.py --host both       --base-url ... --token ...
+    python install_config.py --host codebuddy  --base-url http://10.0.0.5:18888 --token xxx
+    python install_config.py --host both       --base-url ... --token ...   # claude + workbuddy
+    python install_config.py --host all        --base-url ... --token ...   # 三个 host
     python install_config.py --host workbuddy  ... --dry-run    # 只看要写什么
 
 为什么不用 JSON 手改：这两个文件都可能在跑着（Claude Code 会重写 ~/.claude.json），
@@ -28,7 +30,14 @@ SERVER_KEY = "server-management"
 HOSTS = {
     "claude": {"label": "Claude Code CLI", "path": lambda: Path.home() / ".claude.json"},
     "workbuddy": {"label": "WorkBuddy", "path": lambda: Path.home() / ".workbuddy" / "mcp.json"},
+    # CodeBuddy 的用户级推荐路径是 ~/.codebuddy/.mcp.json（带点），
+    # 另有已废弃的 ~/.codebuddy/mcp.json 与 legacy 的 ~/.codebuddy.json，不主动写。
+    "codebuddy": {"label": "CodeBuddy", "path": lambda: Path.home() / ".codebuddy" / ".mcp.json"},
 }
+
+# 一次配多个时用的别名。"both" 只含 claude/workbuddy（保持历史语义），
+# 三个 host 一起配用 "all"。
+HOST_GROUPS = {"both": ["claude", "workbuddy"], "all": ["claude", "workbuddy", "codebuddy"]}
 
 
 def entry_for(base_url, token, python_exe):
@@ -91,13 +100,17 @@ def install(host_key, base_url, token, python_exe, dry_run):
     print("  已写入")
     if host_key == "claude":
         print("  下一步：重启 Claude Code（或新开会话），用 /mcp 确认已连接。")
+    elif host_key == "codebuddy":
+        print("  下一步：重开 CodeBuddy，在 Settings → MCP 里确认状态为已连接、工具已列出。")
     else:
         print("  下一步：打开连接器管理页 → 右上角「自定义连接器」→ 对 server-management 点「信任」，然后新开会话。")
 
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description="注册 server-management MCP 到本机 host 配置")
-    parser.add_argument("--host", required=True, choices=["claude", "workbuddy", "both"])
+    parser.add_argument("--host", required=True,
+                        choices=["claude", "workbuddy", "codebuddy", "both", "all"],
+                        help="写哪个 host 的配置；both=claude+workbuddy，all=三个都写")
     parser.add_argument("--base-url", required=True, help="后端地址，如 http://127.0.0.1:18888")
     parser.add_argument("--token", required=True, help="账号的 API token（页面左下角钥匙 →「获取 Token」）")
     parser.add_argument("--python", default=sys.executable, help="启动 MCP 用的 python 绝对路径，默认当前解释器")
@@ -116,7 +129,7 @@ def main(argv=None):
     print("后端: %s" % base_url)
     print("token: %s…%s（%d 字符）" % (args.token[:4], args.token[-4:], len(args.token)))
 
-    targets = ["claude", "workbuddy"] if args.host == "both" else [args.host]
+    targets = HOST_GROUPS.get(args.host) or [args.host]
     for host_key in targets:
         install(host_key, base_url, args.token, python_exe, args.dry_run)
     return 0

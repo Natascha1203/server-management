@@ -954,7 +954,7 @@ def validate_final_new_data(entity, change, candidate, records):
     return key
 
 
-def approve_change(change, final_new_data=None, conn=None):
+def approve_change(change, final_new_data=None, conn=None, actor=""):
     entity = normalize_entity(change["entity"])
     if change["operation"] == SWAP_OPERATION:
         approve_slot_swap(change, conn)
@@ -978,6 +978,14 @@ def approve_change(change, final_new_data=None, conn=None):
             new_key = validate_final_new_data(entity, change, new, records)
             records[idx] = new
         else:
+            # 删除也走回收站：先落快照再删行，误删还能恢复（与下架实施完成同一条通路）
+            if entity == "servers":
+                snapshot_deleted_server(
+                    deleted=records[idx],
+                    change_id=change["id"],
+                    deleted_by=actor or dict(change).get("submitter", ""),
+                    conn=conn,
+                )
             records = [record for record in records if record_key(meta, record) != key]
     write_records(entity, records)
     # 写库成功后把出现的新标签自动收进候选池（Excel 手工改、导入、API 写入都走这里）
@@ -995,7 +1003,7 @@ def apply_review_action(conn, change, body, reviewer, version_code=None, event_t
     action = body.get("action")
     if action == "approve":
         final_new_data = body.get("new_data") if "new_data" in body else None
-        approved_data = approve_change(change, final_new_data, conn)
+        approved_data = approve_change(change, final_new_data, conn, actor=reviewer)
         version_code = version_code or create_version(conn, change, reviewer)
         if approved_data is not None:
             conn.execute("UPDATE changes SET new_data=? WHERE id=?", (json.dumps(approved_data, ensure_ascii=False), change["id"]))
@@ -1572,7 +1580,7 @@ def complete_rack_request(conn, row, user, server_data=None):
         event_server_data = current
         records = [record for record in records if record["序列号"] != key]
         write_records("servers", records)
-        move_server_to_trash(conn, current, request_id=row["id"], deleted_by=user["用户id"], reason="下架实施完成")
+        move_server_to_trash(conn, current, request_id=row["id"], deleted_by=user["用户id"], reason=TRASH_REASON_RACK_DOWN)
     version_code = storage.create_version_record(conn, row["id"], "servers", operation, final_serial, user["用户id"])
     reviewed_at = now_text()
     conn.execute("""UPDATE rack_requests
@@ -1589,22 +1597,81 @@ def complete_rack_request(conn, row, user, server_data=None):
 
 
 # ---------------------------------------------------------------- 回收站
-# 下架实施完成时把服务器整行快照存进 trash 表，服务器表随即删掉该行。
+# 三个入口会把记录写进 trash 表：
+#   1. 下架实施完成（complete_rack_request）——服务器整行快照，服务器表删行
+#   2. 页面上的「删除 / 批量删除」（approve_change 的删除分支）——同上
+#   3. 回收站里手动登记（add_manual_trash_server）——只有序列号，其余字段等上架时补
 # 只有管理人员能查看 / 重新上架 / 永久删除；永久删除会连带清掉该序列号的资料附件。
 
 RESTORE_EDITABLE_FIELDS = ("客户id", "客户名称", "所在机房", "所属机柜", "所属机位", "备注")
 
+TRASH_REASON_RACK_DOWN = "下架实施完成"
+TRASH_REASON_DELETE = "删除操作（未走上下架流程）"
+TRASH_REASON_MANUAL = "手动登记（信息待补齐）"
 
-def move_server_to_trash(conn, server, request_id="", deleted_by="", reason=""):
+# origin='' 表示来自服务器表的快照；'manual' 表示回收站里手动登记的占位记录。
+TRASH_ORIGIN_MANUAL = "manual"
+
+
+def move_server_to_trash(conn, server, request_id="", deleted_by="", reason="", origin=""):
     trash_id = uuid.uuid4().hex[:12]
     conn.execute(
-        "INSERT INTO trash (id,serial_number,data,request_id,deleted_at,deleted_by,reason) VALUES (?,?,?,?,?,?,?)",
+        "INSERT INTO trash (id,serial_number,data,request_id,deleted_at,deleted_by,reason,origin)"
+        " VALUES (?,?,?,?,?,?,?,?)",
         (
             trash_id, clean_value(server.get("序列号")), json.dumps(server, ensure_ascii=False),
-            request_id, now_text(), deleted_by, reason,
+            request_id, now_text(), deleted_by, reason, origin,
         ),
     )
     return trash_id
+
+
+def add_manual_trash_server(serial, actor="", extra=None):
+    """在回收站手动登记一台服务器：序列号必填，其他字段留空等重新上架时再补。
+
+    这条记录只是占位（origin='manual'），不参与任何服务器校验；补全信息的校验
+    发生在重新上架那一刻，所以这里只挡「序列号为空」「已存在」这类硬冲突。
+    """
+    serial = clean_value(serial)
+    if not serial:
+        raise ValueError("序列号不能为空")
+    if any(clean_value(row.get("序列号")) == serial for row in read_records("servers")):
+        raise ValueError(f"序列号 {serial} 已在服务器表中，无需在回收站登记")
+    headers = ENTITIES["servers"]["headers"]
+    extra = {key: value for key, value in (extra or {}).items() if key in headers and key != "序列号"}
+    with db() as conn:
+        duplicate = conn.execute("SELECT id FROM trash WHERE serial_number=?", (serial,)).fetchone()
+        if duplicate:
+            raise ValueError(f"序列号 {serial} 已在回收站中，请直接编辑后重新上架")
+        server = normalize_row("servers", {"序列号": serial, **extra})
+        trash_id = move_server_to_trash(
+            conn, server, request_id="", deleted_by=actor,
+            reason=TRASH_REASON_MANUAL, origin=TRASH_ORIGIN_MANUAL,
+        )
+        notify_audit_event(conn, {
+            "event_type": "manual_added",
+            "audit_type": "回收站",
+            "title": "回收站手动登记服务器",
+            "entity_label": "服务器",
+            "operation": "手动登记",
+            "record_key": serial,
+            "reviewer": actor,
+            "time": now_text(),
+            "summary": summarize_record(server, ["序列号"]) or serial,
+        })
+    return trash_id
+
+
+def snapshot_deleted_server(deleted, change_id="", deleted_by="", reason=TRASH_REASON_DELETE, conn=None):
+    """把被删的服务器整行写进回收站。
+
+    调用方通常已经持有 db 连接（审批事务内），传进来就复用同一事务；
+    没有连接时自己开一个。快照必须先于删行落地，写入失败宁可整体报错也不能丢数据。
+    """
+    if conn is not None:
+        return move_server_to_trash(conn, deleted, request_id=change_id, deleted_by=deleted_by, reason=reason)
+    with db() as own:
+        return move_server_to_trash(own, deleted, request_id=change_id, deleted_by=deleted_by, reason=reason)
 
 
 def trash_rows():
@@ -1622,6 +1689,7 @@ def trash_to_json(row):
         "deleted_at": row["deleted_at"],
         "deleted_by": row["deleted_by"],
         "reason": row["reason"],
+        "origin": dict(row).get("origin", ""),
     })
     return item
 
@@ -1631,6 +1699,9 @@ def restore_trash(trash_id, overrides=None, actor=""):
 
     允许顺便改客户与机位（overrides），校验不过就整单拒绝——冲突时由管理人员先
     补登客户 / 腾出机位，再回来恢复，不做静默降级。
+
+    手动登记的占位记录（origin='manual'）本身没有信息，所以这一次提交允许补齐
+    **任意服务器字段**，而不是像下架快照那样只放开客户/机位那几列。
     """
     overrides = overrides or {}
     with db() as conn:
@@ -1642,11 +1713,18 @@ def restore_trash(trash_id, overrides=None, actor=""):
     if any(item["序列号"] == serial for item in records):
         raise ValueError(f"序列号 {serial} 已在服务器表中，不能重复恢复")
     snapshot = parse_json_dict(row["data"])
-    merged = normalize_row("servers", {**snapshot, **{k: v for k, v in overrides.items() if k in snapshot or k in RESTORE_EDITABLE_FIELDS}})
+    manual = clean_value(dict(row).get("origin")) == TRASH_ORIGIN_MANUAL
+    if manual:
+        headers = ENTITIES["servers"]["headers"]
+        picked = {key: value for key, value in overrides.items() if key in headers}
+    else:
+        picked = {key: value for key, value in overrides.items() if key in snapshot or key in RESTORE_EDITABLE_FIELDS}
+    merged = normalize_row("servers", {**snapshot, **picked})
     merged["序列号"] = serial
     normalized, errors = validate_record("servers", merged)
     if errors:
-        raise ValueError("；".join(errors))
+        prefix = "手动登记记录信息不完整：" if manual else ""
+        raise ValueError(prefix + "；".join(errors))
     records.append(normalized)
     write_records("servers", records)
     with db() as conn:
