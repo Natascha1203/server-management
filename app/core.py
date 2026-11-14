@@ -288,9 +288,10 @@ def capabilities_for(user):
         return []
     role_name = user["身份"]
     if role_name == ROLE_ADMIN:
-        return ["manage_all", "review_operations", "review_rack_requests", "submit_rack_request", "manage_settings", "view_statistics"]
+        return ["manage_all", "review_operations", "review_rack_requests", "submit_rack_request", "manage_settings", "view_statistics", "view_trash"]
     if role_name == ROLE_ROOM:
-        return ["review_rack_requests", "view_statistics"]
+        # 机房人员：本机房的回收站可以查看并重新上架；手动登记与永久删除仍归管理人员
+        return ["review_rack_requests", "view_statistics", "view_trash"]
     if role_name == ROLE_BUSINESS:
         return ["submit_rack_request"]
     return []

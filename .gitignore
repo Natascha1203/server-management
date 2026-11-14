@@ -2,6 +2,7 @@
 *
 !*/
 !.gitignore
+!push.cmd
 
 !app/
 !app/**
@@ -13,6 +14,8 @@
 !docs/**
 !server_management_skill/
 !server_management_skill/**
+!tests/
+!tests/**
 
 # 编译器产物与本地配置，一律不进仓库
 __pycache__/

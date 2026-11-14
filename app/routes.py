@@ -99,14 +99,18 @@ def is_admin_user(user=None):
     return (user or current_user())["身份"] == ROLE_ADMIN
 
 
-def apply_change(entity, operation, key, row=None, user=None):
-    """按角色决定变更生效方式：管理员直接生效（免审批），其他角色提交待审批。返回 change_id。"""
+def apply_change(entity, operation, key, row=None, user=None, takeover=False):
+    """按角色决定变更生效方式：管理员直接生效（免审批），其他角色提交待审批。返回 change_id。
+
+    takeover：修改时是否占走目标机位（把原占用者下架进回收站）。意图随变更一起落库，
+    真正执行在批准那一刻，避免审批期间意图丢失。
+    """
     user = user or current_user()
     if user["身份"] == ROLE_ADMIN:
         return services.submit_and_approve_change(
-            entity, operation, key, row, submitter=user["用户id"], reviewer=user["用户id"]
+            entity, operation, key, row, submitter=user["用户id"], reviewer=user["用户id"], takeover=takeover
         )
-    return services.submit_change(entity, operation, key, row, submitter=user["用户id"])
+    return services.submit_change(entity, operation, key, row, submitter=user["用户id"], takeover=takeover)
 
 
 def ensure_entity_view_response(entity):
@@ -562,14 +566,25 @@ def add_entity(entity):
         return denied
     entity = normalize_entity(entity)
     current = storage.read_records(entity)
-    row, errors = services.validate_record(entity, request.get_json(silent=True) or {}, current)
+    body = dict(request.get_json(silent=True) or {})
+    # takeover：新增时也允许占走已被占用的机位（原占用者整台下架进回收站）。
+    # 意图必须显式传，默认仍按机位冲突拦截——这是会让别人机器下线的操作。
+    takeover = bool(body.pop("takeover", False)) and entity == "servers"
+    row, errors = services.validate_record(entity, body, current, allow_occupied_slots=takeover)
     if errors:
         return jsonify(error="；".join(errors)), 400
     from .core import record_key
 
     user = current_user()
-    change_id = apply_change(entity, "新增", record_key(ENTITIES[entity], row), row, user)
+    displaced = services.takeover_victims(current, row) if takeover else []
+    change_id = apply_change(entity, "新增", record_key(ENTITIES[entity], row), row, user, takeover=takeover)
     message = "已保存并直接生效" if is_admin_user(user) else "已提交新增申请"
+    if displaced:
+        titles = "、".join(clean_value(item.get("序列号")) for item in displaced)
+        message += (
+            f"；机位原有服务器 {titles} 已下架到回收站" if is_admin_user(user)
+            else f"；审批通过后机位原有服务器 {titles} 将被下架到回收站"
+        )
     return jsonify(message=message, change_id=change_id)
 
 
@@ -663,7 +678,13 @@ def update_entity(entity):
     old = normalize_row(entity, body.get("old") or {})
     records = storage.read_records(entity)
     old_key = record_key(ENTITIES[entity], old)
-    new, errors = services.validate_record(entity, body.get("new") or {}, None, old_key if entity == "servers" else None)
+    # takeover：显式要求占走目标机位（原占用者整台下架进回收站），默认仍按占用冲突拦截
+    takeover = bool(body.get("takeover")) and entity == "servers"
+    new, errors = services.validate_record(
+        entity, body.get("new") or {}, None,
+        old_key if entity == "servers" else None,
+        allow_occupied_slots=takeover,
+    )
     current = next((x for x in records if record_key(ENTITIES[entity], x) == old_key), None)
     if not current:
         return jsonify(error="原记录不存在或已变化，请刷新后重试"), 409
@@ -678,8 +699,15 @@ def update_entity(entity):
     if pending:
         return jsonify(error=f"记录 {old_key} 已有待审批{pending['operation']}申请，请切换到待审批状态处理"), 409
     user = current_user()
-    change_id = apply_change(entity, "修改", old_key, new, user)
+    displaced = services.takeover_victims(records, new, exclude_key=old_key) if takeover else []
+    change_id = apply_change(entity, "修改", old_key, new, user, takeover=takeover)
     message = "已保存并直接生效" if is_admin_user(user) else "已提交修改申请"
+    if displaced:
+        titles = "、".join(clean_value(item.get("序列号")) for item in displaced)
+        message += (
+            f"；机位原有服务器 {titles} 已下架到回收站" if is_admin_user(user)
+            else f"；审批通过后机位原有服务器 {titles} 将被下架到回收站"
+        )
     return jsonify(message=message, change_id=change_id)
 
 
@@ -1359,21 +1387,24 @@ def review_rack_request(request_id):
             storage.prune_audit_records(conn)
             return jsonify(message="上下架请求已驳回")
         stage = row["stage"] if "stage" in row.keys() and row["stage"] else initial_rack_request_stage(row["request_type"])
+        # takeover：允许占走已被占用的机位（原服务器整台下架进回收站）。
+        # 分配阶段只记录意图；实施阶段真正执行，因此这里先落到请求上。
+        takeover = bool(body.get("takeover")) or bool(dict(row).get("takeover"))
         if stage == "allocation":
             if row["request_type"] != "上架":
                 return jsonify(error="下架请求不需要机位IP分配"), 400
             server_data = services.rack_server_draft(row, body.get("server_data") or {})
-            errors = services.validate_rack_allocation(server_data, request_id)
+            errors = services.validate_rack_allocation(server_data, request_id, allow_takeover=takeover)
             if errors:
                 return jsonify(error="；".join(errors)), 400
             from .core import now_text
 
             reviewed_at = now_text()
             conn.execute("""UPDATE rack_requests
-                SET serial_number=?,stage='implementation',stage_data=?,allocation_reviewer_id=?,allocation_at=?,reviewer_id=?,reviewed_at=?,reject_reason=''
+                SET serial_number=?,stage='implementation',stage_data=?,allocation_reviewer_id=?,allocation_at=?,reviewer_id=?,reviewed_at=?,reject_reason='',takeover=?
                 WHERE id=?""", (
                 server_data["序列号"], json.dumps(server_data, ensure_ascii=False), user["用户id"], reviewed_at,
-                user["用户id"], reviewed_at, request_id,
+                user["用户id"], reviewed_at, 1 if takeover else 0, request_id,
             ))
             event_row = dict(row)
             event_row["reviewed_at"] = reviewed_at
@@ -1401,7 +1432,7 @@ def review_rack_request(request_id):
                 return jsonify(error="；".join(conflict_errors)), 400
         else:
             server_data = {}
-        message, errors = services.complete_rack_request(conn, row, user, server_data)
+        message, errors = services.complete_rack_request(conn, row, user, server_data, takeover=takeover)
         if errors:
             return jsonify(error="；".join(errors)), 400 if "不存在" not in "；".join(errors) else 409
         storage.prune_audit_records(conn)
@@ -1409,15 +1440,24 @@ def review_rack_request(request_id):
 
 
 # ---------------------------------------------------------------- 回收站
-# 服务器整行进回收站有三个入口：下架实施完成、页面删除/批量删除、回收站手动登记。
-# 只有管理人员能看、能手动登记、能重新上架、能永久删除。
+# 服务器整行进回收站有四个入口：下架实施完成、页面删除/批量删除、回收站手动登记、
+# 上架/变更时占用已有机位（原占用者自动下架）。
+# 管理人员：全部记录，可查看 / 手动登记 / 重新上架 / 永久删除。
+# 机房人员：只看本机房，可查看与重新上架；手动登记与永久删除仍归管理人员。
 
 @bp.get("/api/trash")
 @require_login
 def trash_api():
-    if "manage_settings" not in capabilities_for(current_user()):
+    user = current_user()
+    if "view_trash" not in capabilities_for(user):
         return forbidden()
-    return jsonify(items=[services.trash_to_json(row) for row in services.trash_rows()])
+    room = user["所属机房"] if user["身份"] == ROLE_ROOM else ""
+    return jsonify(
+        items=[services.trash_to_json(row) for row in services.trash_rows(room)],
+        # 快照存的是服务器整行，字段清单由后端下发，前端不再自己维护一份
+        headers=ENTITIES["servers"]["headers"],
+        can_manage="manage_settings" in capabilities_for(user),
+    )
 
 
 @bp.post("/api/trash")
@@ -1445,12 +1485,20 @@ def add_trash_api():
 @require_login
 def restore_trash_api(trash_id):
     user = current_user()
-    if "manage_settings" not in capabilities_for(user):
+    if "view_trash" not in capabilities_for(user):
         return forbidden()
+    if user["身份"] == ROLE_ROOM:
+        # 机房人员只能恢复本机房的记录
+        if services.trash_entry(trash_id, room=user["所属机房"]) is None:
+            return forbidden()
     body = request.get_json(silent=True) or {}
     try:
         with storage.LOCK:
-            record = services.restore_trash(trash_id, body.get("server_data") or {}, actor=user["用户id"])
+            record = services.restore_trash(
+                trash_id, body.get("server_data") or {}, actor=user["用户id"],
+                # 机房人员：恢复后仍须留在本机房，不能借改字段把机器挪走
+                room_scope=user["所属机房"] if user["身份"] == ROLE_ROOM else "",
+            )
     except ValueError as exc:
         return jsonify(error=str(exc)), 400
     return jsonify(message=f"序列号 {record['序列号']} 已重新上架", record=record)

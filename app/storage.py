@@ -98,7 +98,8 @@ CHANGES_SCHEMA = """CREATE TABLE IF NOT EXISTS changes (
     id TEXT PRIMARY KEY, entity TEXT NOT NULL, operation TEXT NOT NULL,
     record_key TEXT NOT NULL, new_data TEXT,
     status TEXT NOT NULL, submitter TEXT NOT NULL, submitted_at TEXT NOT NULL,
-    reviewer TEXT, reviewed_at TEXT, reject_reason TEXT
+    reviewer TEXT, reviewed_at TEXT, reject_reason TEXT,
+    takeover INTEGER NOT NULL DEFAULT 0
 )"""
 
 RACK_REQUESTS_SCHEMA = """CREATE TABLE IF NOT EXISTS rack_requests (
@@ -117,7 +118,8 @@ RACK_REQUESTS_SCHEMA = """CREATE TABLE IF NOT EXISTS rack_requests (
     implementation_at TEXT,
     reviewer_id TEXT,
     reviewed_at TEXT,
-    reject_reason TEXT
+    reject_reason TEXT,
+    takeover INTEGER NOT NULL DEFAULT 0
 )"""
 
 SETTINGS_SCHEMA = """CREATE TABLE IF NOT EXISTS settings (
@@ -144,7 +146,8 @@ ATTACHMENTS_SCHEMA = """CREATE TABLE IF NOT EXISTS attachments (
 # 回收站：服务器整行快照暂存处，来源有两类——
 #   origin=''       来自服务器表（下架实施完成 / 直接删除）
 #   origin='manual' 回收站里手动登记，只有序列号，其余字段等重新上架时补
-# 只有管理人员能看/恢复/永久删除；恢复时可改客户与机位（重新上架）。
+# 管理人员可看/恢复/永久删除，机房人员限本机房（可看/可恢复）；
+# 重新上架时整行字段都能改（含序列号，改名后附件跟着迁）。
 TRASH_SCHEMA = """CREATE TABLE IF NOT EXISTS trash (
     id TEXT PRIMARY KEY,
     serial_number TEXT NOT NULL,
@@ -177,15 +180,16 @@ ARCHIVE_FOLDER_MAX = 60
 def ensure_changes_schema(conn):
     conn.execute(CHANGES_SCHEMA)
     columns = [row["name"] for row in conn.execute("PRAGMA table_info(changes)").fetchall()]
-    if "old_data" not in columns:
-        return
-    conn.execute("ALTER TABLE changes RENAME TO changes_with_old_data")
-    conn.execute(CHANGES_SCHEMA)
-    conn.execute("""INSERT INTO changes
+    if "old_data" in columns:
+        conn.execute("ALTER TABLE changes RENAME TO changes_with_old_data")
+        conn.execute(CHANGES_SCHEMA)
+        conn.execute("""INSERT INTO changes
         (id,entity,operation,record_key,new_data,status,submitter,submitted_at,reviewer,reviewed_at,reject_reason)
         SELECT id,entity,operation,record_key,new_data,status,submitter,submitted_at,reviewer,reviewed_at,reject_reason
         FROM changes_with_old_data""")
-    conn.execute("DROP TABLE changes_with_old_data")
+        conn.execute("DROP TABLE changes_with_old_data")
+    # takeover：这条变更生效时是否要占走目标机位（把原占用者下架进回收站）
+    add_column_if_missing(conn, "changes", "takeover", "takeover INTEGER NOT NULL DEFAULT 0")
 
 
 def add_column_if_missing(conn, table_name, column_name, column_sql):
@@ -204,6 +208,8 @@ def ensure_rack_requests_schema(conn):
     add_column_if_missing(conn, "rack_requests", "allocation_at", "allocation_at TEXT")
     add_column_if_missing(conn, "rack_requests", "implementation_reviewer_id", "implementation_reviewer_id TEXT")
     add_column_if_missing(conn, "rack_requests", "implementation_at", "implementation_at TEXT")
+    # takeover：上架/变更实施时是否占走已被占用的机位（把原占用者下架进回收站）
+    add_column_if_missing(conn, "rack_requests", "takeover", "takeover INTEGER NOT NULL DEFAULT 0")
     conn.execute("""UPDATE rack_requests
         SET stage = CASE
             WHEN request_type='上架' THEN 'allocation'

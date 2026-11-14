@@ -18,7 +18,7 @@
       </div>
       <button class="nav-item" data-page="statistics" data-capability="view_statistics"><span>▥</span> 机柜统计</button>
       <button class="nav-item" data-page="rackRequests" data-capability="submit_rack_request"><span>⇅</span> 上下架请求</button>
-      <button class="nav-item" data-page="trash" data-capability="manage_settings"><span>🗑</span> 回收站 <i id="trashBadge" class="badge" hidden>0</i></button>
+      <button class="nav-item" data-page="trash" data-capability="view_trash"><span>🗑</span> 回收站 <i id="trashBadge" class="badge" hidden>0</i></button>
       <button class="nav-item" data-page="settings" data-capability="manage_settings"><span>⚙</span> 设置</button>
     </nav>
     <div class="account"><div class="avatar">{{ username[0]|upper }}</div><div><b>{{ username }}</b><small>{{ role_name }}</small></div><div class="key-menu-wrap"><button id="tokenBtn" type="button" title="账号工具">🔑</button><div id="keyMenu" class="key-menu" hidden><button id="keyMenuToken" type="button">🔑 获取 Token</button><button id="keyMenuMcp" type="button">⬇ 下载 MCP</button></div></div><form method="post" action="/logout"><button title="退出">↪</button></form></div>
@@ -161,8 +161,8 @@
     </section>
 
     <section id="trash" class="page">
-      <div class="hero"><div><h2>回收站</h2><p>下架或删除的服务器整行暂存在这里。可以修改客户 / 机位后重新上架，或永久删除；也可以手动登记只有序列号的服务器，信息等重新上架时再补。</p></div><div class="hero-note"><b>仅管理人员</b><span>永久删除会连带清理该序列号的资料附件</span></div></div>
-      <form id="trashAddForm" class="card form-grid trash-add-form" autocomplete="off">
+      <div class="hero"><div><h2>回收站</h2><p>下架、删除或被新服务器占用机位的服务器整行暂存在这里，保存的是服务器表当时的全部信息。可以修改客户 / 机位后重新上架；管理人员还可以永久删除，或手动登记只有序列号的服务器。</p></div><div class="hero-note"><b>机房人员只看本机房</b><span>永久删除与手动登记仅限管理人员</span></div></div>
+      <form id="trashAddForm" class="card form-grid trash-add-form" autocomplete="off" hidden>
         <label>序列号<input id="trashAddSerial" name="序列号" placeholder="必填，其他信息可在重新上架时再补"></label>
         <div class="review-actions wide"><button class="btn primary" type="submit">手动加入回收站</button></div>
       </form>

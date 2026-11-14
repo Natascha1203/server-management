@@ -810,15 +810,21 @@ def validate_pending_change_update(change, candidate):
     entity = normalize_entity(change["entity"])
     meta = ENTITIES[entity]
     records = read_records(entity)
+    # 申请提交时就带了占用意图：编辑申请内容后仍然允许占着那些机位，否则用户一改备注就被拦下
+    allow_takeover = bool(dict(change).get("takeover")) and entity == "servers"
     if change["operation"] == "新增":
-        normalized, errors = validate_record(entity, candidate, records)
+        normalized, errors = validate_record(
+            entity, candidate, records, allow_occupied_slots=allow_takeover
+        )
         key = record_key(meta, normalized)
     else:
         current = next((item for item in records if record_key(meta, item) == change["record_key"]), None)
         if not current:
             raise ValueError("原记录不存在或已变化，请刷新后重试")
         exclude_key = change["record_key"] if entity == "servers" else None
-        normalized, errors = validate_record(entity, candidate, None, exclude_key)
+        normalized, errors = validate_record(
+            entity, candidate, None, exclude_key, allow_occupied_slots=allow_takeover
+        )
         key = record_key(meta, normalized)
         if key != change["record_key"] and entity != "customers":
             errors.append("不允许修改主键字段")
@@ -885,17 +891,17 @@ def rack_request_event(row, event_type, title, reviewer=""):
     }
 
 
-def submit_change(entity, operation, record_key_value, new_data=None, submitter=""):
+def submit_change(entity, operation, record_key_value, new_data=None, submitter="", takeover=False):
     entity = normalize_entity(entity)
     change_id = uuid.uuid4().hex[:12]
     submitted_at = now_text()
     with LOCK, db() as conn:
         conn.execute("""INSERT INTO changes
-            (id,entity,operation,record_key,new_data,status,submitter,submitted_at)
-            VALUES (?,?,?,?,?,?,?,?)""", (
+            (id,entity,operation,record_key,new_data,status,submitter,submitted_at,takeover)
+            VALUES (?,?,?,?,?,?,?,?,?)""", (
             change_id, entity, operation, record_key_value,
             json.dumps(new_data, ensure_ascii=False) if new_data else None,
-            "pending", submitter, submitted_at,
+            "pending", submitter, submitted_at, 1 if takeover else 0,
         ))
         storage.sync_pending_excel(conn)
         notify_audit_event(conn, operation_change_event({
@@ -911,7 +917,7 @@ def submit_change(entity, operation, record_key_value, new_data=None, submitter=
     return change_id
 
 
-def submit_and_approve_change(entity, operation, record_key_value, new_data=None, submitter="", reviewer=""):
+def submit_and_approve_change(entity, operation, record_key_value, new_data=None, submitter="", reviewer="", takeover=False):
     """管理员直改：在单个事务内提交变更并立即批准生效。
 
     复用 apply_review_action 的批准内核（approve_change + 版本记录 + 审计事件 + 待审核 Excel 同步），
@@ -924,11 +930,11 @@ def submit_and_approve_change(entity, operation, record_key_value, new_data=None
     submitted_at = now_text()
     with LOCK, db() as conn:
         conn.execute("""INSERT INTO changes
-            (id,entity,operation,record_key,new_data,status,submitter,submitted_at)
-            VALUES (?,?,?,?,?,?,?,?)""", (
+            (id,entity,operation,record_key,new_data,status,submitter,submitted_at,takeover)
+            VALUES (?,?,?,?,?,?,?,?,?)""", (
             change_id, entity, operation, record_key_value,
             json.dumps(new_data, ensure_ascii=False) if new_data else None,
-            "pending", submitter, submitted_at,
+            "pending", submitter, submitted_at, 1 if takeover else 0,
         ))
         change = conn.execute("SELECT * FROM changes WHERE id=?", (change_id,)).fetchone()
         apply_review_action(conn, change, {"action": "approve"}, reviewer=reviewer, event_title="管理员变更直接生效")
@@ -937,11 +943,13 @@ def submit_and_approve_change(entity, operation, record_key_value, new_data=None
     return change_id
 
 
-def validate_final_new_data(entity, change, candidate, records):
+def validate_final_new_data(entity, change, candidate, records, allow_takeover=False):
     entity = normalize_entity(entity)
     meta = ENTITIES[entity]
     exclude_key = change["record_key"] if entity == "servers" and change["operation"] == "修改" else None
-    normalized, errors = validate_record(entity, candidate, None, exclude_key)
+    normalized, errors = validate_record(
+        entity, candidate, None, exclude_key, allow_occupied_slots=allow_takeover
+    )
     key = record_key(meta, normalized)
     if key != change["record_key"] and not (entity == "customers" and change["operation"] == "修改"):
         errors.append("审核时不允许修改主键字段")
@@ -965,7 +973,22 @@ def approve_change(change, final_new_data=None, conn=None, actor=""):
     if change["operation"] == "新增":
         if not new:
             raise ValueError("新增申请缺少审批后数据")
-        key = validate_final_new_data(entity, change, new, records)
+        takeover = bool(dict(change).get("takeover")) and entity == "servers"
+        key = validate_final_new_data(entity, change, new, records, allow_takeover=takeover)
+        if takeover:
+            displaced = takeover_victims(records, new)
+            if displaced:
+                victims = {clean_value(item.get("序列号")) for item in displaced}
+                for victim in displaced:
+                    snapshot_deleted_server(
+                        victim,
+                        change_id=change["id"],
+                        deleted_by=actor or dict(change).get("submitter", ""),
+                        reason=TRASH_REASON_TAKEOVER,
+                        conn=conn,
+                    )
+                # 先腾位再落新记录：否则新记录和原占用者会同时出现在同一机位上
+                records = [item for item in records if clean_value(item.get("序列号")) not in victims]
         records.append(new)
     else:
         key = change["record_key"]
@@ -975,7 +998,25 @@ def approve_change(change, final_new_data=None, conn=None, actor=""):
         if change["operation"] == "修改":
             if not new:
                 raise ValueError("修改申请缺少审批后数据")
-            new_key = validate_final_new_data(entity, change, new, records)
+            takeover = bool(dict(change).get("takeover"))
+            new_key = validate_final_new_data(entity, change, new, records, allow_takeover=takeover)
+            if takeover and entity == "servers":
+                displaced = takeover_victims(records, new, exclude_key=key)
+                if displaced:
+                    victims = {clean_value(item.get("序列号")) for item in displaced}
+                    for victim in displaced:
+                        snapshot_deleted_server(
+                            victim,
+                            change_id=change["id"],
+                            deleted_by=actor or dict(change).get("submitter", ""),
+                            reason=TRASH_REASON_TAKEOVER,
+                            conn=conn,
+                        )
+                    records = [item for item in records if clean_value(item.get("序列号")) not in victims]
+                    # 下架了别人之后原下标可能已经错位，按主键重新定位
+                    idx = next((i for i, x in enumerate(records) if record_key(meta, x) == key), None)
+                    if idx is None:
+                        raise ValueError(f"当前记录 {key} 已不存在，无法审批")
             records[idx] = new
         else:
             # 删除也走回收站：先落快照再删行，误删还能恢复（与下架实施完成同一条通路）
@@ -1521,10 +1562,37 @@ def implementation_slot_conflict_errors(server_data, request_id=""):
     return errors
 
 
-def validate_rack_allocation(server_data, request_id=""):
+def takeover_victims(records, server_data, exclude_key=""):
+    """目标机位上被别的服务器占用的记录 —— 这些记录会被整台移到回收站。
+
+    机位是物理连续分配的，只取「相交的那几 U」没有意义：一台机器占 18-19，
+    新机器只要 19，整台都必须下架，18-19 才能腾出来。
+    """
+    room = clean_value(server_data.get("所在机房"))
+    cabinet_name = clean_value(server_data.get("所属机柜"))
+    target = {str(pos) for pos in positions(clean_value(server_data.get("所属机位")))}
+    if not room or not cabinet_name or not target:
+        return []
+    exclude = clean_value(exclude_key)
+    victims = []
+    for record in records:
+        if exclude and clean_value(record.get("序列号")) == exclude:
+            continue
+        if clean_value(record.get("所在机房")) != room:
+            continue
+        if clean_value(record.get("所属机柜")) != cabinet_name:
+            continue
+        if target & {str(pos) for pos in positions(clean_value(record.get("所属机位")))}:
+            victims.append(record)
+    return victims
+
+
+def validate_rack_allocation(server_data, request_id="", allow_takeover=False):
     required = ["所在机房", "所属机柜", "所属机位", "管理ip", "带外ip"]
     errors = [f"{field}不能为空" for field in required if not clean_value(server_data.get(field))]
-    _, record_errors = validate_record("servers", server_data, read_records("servers"))
+    _, record_errors = validate_record(
+        "servers", server_data, read_records("servers"), allow_occupied_slots=allow_takeover
+    )
     return errors + record_errors + implementation_slot_conflict_errors(server_data, request_id) + same_kind_ip_conflict_errors(
         normalize_row("servers", server_data),
         include_official=False,
@@ -1544,20 +1612,37 @@ def notify_rack_stage(conn, row, event_type, title, reviewer, server_data=None):
     notify_audit_event(conn, rack_request_event(event_row, event_type, title, reviewer))
 
 
-def complete_rack_request(conn, row, user, server_data=None):
-    """具体实施收尾：按请求类型新增 / 更新 / 移入回收站。"""
+def complete_rack_request(conn, row, user, server_data=None, takeover=False):
+    """具体实施收尾：按请求类型新增 / 更新 / 移入回收站。
+
+    takeover=True 表示允许占走已被占用的机位：目标机位上原有的服务器会整台
+    移进回收站（reason=机位被占用），腾出位置后再写入本次记录。
+    """
     records = read_records("servers")
     request_type = row["request_type"]
     key = row["serial_number"]
     event_server_data = server_data or {}
     operation = {"上架": "新增", "变更": "更新"}.get(request_type, "删除")
     final_serial = key
+    displaced = []
     if request_type == "上架":
-        normalized, errors = validate_record("servers", server_data or {}, records)
+        normalized, errors = validate_record(
+            "servers", server_data or {}, records, allow_occupied_slots=takeover
+        )
         if errors:
             return None, errors
         event_server_data = normalized
         final_serial = record_key(ENTITIES["servers"], normalized)
+        if takeover:
+            displaced = takeover_victims(records, normalized)
+            if displaced:
+                victims = {clean_value(item.get("序列号")) for item in displaced}
+                for victim in displaced:
+                    move_server_to_trash(
+                        conn, victim, request_id=row["id"], deleted_by=user["用户id"],
+                        reason=TRASH_REASON_TAKEOVER,
+                    )
+                records = [item for item in records if clean_value(item.get("序列号")) not in victims]
         records.append(normalized)
         write_records("servers", records)
     elif request_type == "变更":
@@ -1567,10 +1652,22 @@ def complete_rack_request(conn, row, user, server_data=None):
         current_key = record_key(ENTITIES["servers"], current)
         merged = rack_server_draft(row, server_data, base=current)
         merged["序列号"] = key  # 序列号是定位键，变更不允许改
-        normalized, errors = validate_record("servers", merged, exclude_record_key=current_key)
+        normalized, errors = validate_record(
+            "servers", merged, exclude_record_key=current_key, allow_occupied_slots=takeover
+        )
         if errors:
             return None, errors
         event_server_data = normalized
+        if takeover:
+            displaced = takeover_victims(records, normalized, exclude_key=key)
+            if displaced:
+                victims = {clean_value(item.get("序列号")) for item in displaced}
+                for victim in displaced:
+                    move_server_to_trash(
+                        conn, victim, request_id=row["id"], deleted_by=user["用户id"],
+                        reason=TRASH_REASON_TAKEOVER,
+                    )
+                records = [item for item in records if clean_value(item.get("序列号")) not in victims]
         records = [normalized if item["序列号"] == key else item for item in records]
         write_records("servers", records)
     else:
@@ -1592,22 +1689,32 @@ def complete_rack_request(conn, row, user, server_data=None):
     ))
     event_row = dict(row)
     event_row["reviewed_at"] = reviewed_at
+    if displaced:
+        titles = "、".join(clean_value(item.get("序列号")) for item in displaced)
+        message = (
+            f"服务器{request_type}具体实施已完成，已生成版本 {version_code}；"
+            f"占用的机位原有服务器 {titles} 已下架并移入回收站"
+        )
+    else:
+        message = f"服务器{request_type}具体实施已完成，已生成版本 {version_code}"
     notify_rack_stage(conn, event_row, "approved", "服务器上下架具体实施已完成", user["用户id"], event_server_data)
-    return f"服务器{request_type}具体实施已完成，已生成版本 {version_code}", []
+    return message, []
 
 
 # ---------------------------------------------------------------- 回收站
-# 三个入口会把记录写进 trash 表：
+# 四个入口会把记录写进 trash 表：
 #   1. 下架实施完成（complete_rack_request）——服务器整行快照，服务器表删行
 #   2. 页面上的「删除 / 批量删除」（approve_change 的删除分支）——同上
 #   3. 回收站里手动登记（add_manual_trash_server）——只有序列号，其余字段等上架时补
-# 只有管理人员能查看 / 重新上架 / 永久删除；永久删除会连带清掉该序列号的资料附件。
-
-RESTORE_EDITABLE_FIELDS = ("客户id", "客户名称", "所在机房", "所属机柜", "所属机位", "备注")
+#   4. 上架/变更占用已有机位（takeover）——原占用者整台下架，reason=机位被占用
+# 管理人员可查看 / 重新上架 / 永久删除；机房人员只看本机房，可查看与重新上架。
+# 永久删除会连带清掉该序列号的资料附件。
+# 重新上架时可以改**整行任意字段**（含序列号）：改序列号时该序列号的资料附件一起改名。
 
 TRASH_REASON_RACK_DOWN = "下架实施完成"
 TRASH_REASON_DELETE = "删除操作（未走上下架流程）"
 TRASH_REASON_MANUAL = "手动登记（信息待补齐）"
+TRASH_REASON_TAKEOVER = "机位被新服务器占用，自动下架"
 
 # origin='' 表示来自服务器表的快照；'manual' 表示回收站里手动登记的占位记录。
 TRASH_ORIGIN_MANUAL = "manual"
@@ -1674,10 +1781,33 @@ def snapshot_deleted_server(deleted, change_id="", deleted_by="", reason=TRASH_R
         return move_server_to_trash(own, deleted, request_id=change_id, deleted_by=deleted_by, reason=reason)
 
 
-def trash_rows():
+def trash_rows(room=""):
+    """回收站记录。room 非空时只返回该机房的 —— 机房人员只看本机房。
+
+    手动登记的占位记录没有「所在机房」，只对管理人员可见（也只能由管理人员登记）。
+    """
     with db() as conn:
         rows = conn.execute("SELECT * FROM trash ORDER BY deleted_at DESC, rowid DESC").fetchall()
-    return [dict(row) for row in rows]
+    items = [dict(row) for row in rows]
+    if room:
+        target = clean_value(room)
+        items = [
+            item for item in items
+            if clean_value(parse_json_dict(item.get("data")).get("所在机房")) == target
+        ]
+    return items
+
+
+def trash_entry(trash_id, room=""):
+    """取单条回收站记录（含快照字段）；room 非空时校验归属机房，不匹配返回 None。"""
+    with db() as conn:
+        row = conn.execute("SELECT * FROM trash WHERE id=?", (trash_id,)).fetchone()
+    if not row:
+        return None
+    item = trash_to_json(row)
+    if room and clean_value(item.get("所在机房")) != clean_value(room):
+        return None
+    return item
 
 
 def trash_to_json(row):
@@ -1694,14 +1824,19 @@ def trash_to_json(row):
     return item
 
 
-def restore_trash(trash_id, overrides=None, actor=""):
+def restore_trash(trash_id, overrides=None, actor="", room_scope=""):
     """重新上架：把快照写回服务器表。
 
-    允许顺便改客户与机位（overrides），校验不过就整单拒绝——冲突时由管理人员先
-    补登客户 / 腾出机位，再回来恢复，不做静默降级。
+    overrides 允许改**整行任意服务器字段**（品牌/型号/IP/密码/备注…），不只是客户与机位；
+    序列号也可以改，改完该序列号的资料附件一起迁到新序列号，避免恢复后档案对不上。
+    校验不过就整单拒绝——冲突时由管理人员先补登客户 / 腾出机位，再回来恢复，
+    不做静默降级。
 
-    手动登记的占位记录（origin='manual'）本身没有信息，所以这一次提交允许补齐
-    **任意服务器字段**，而不是像下架快照那样只放开客户/机位那几列。
+    room_scope 非空表示调用方只能操作该机房（机房人员）：恢复后的「所在机房」必须
+    还是这个机房，否则等于借恢复把机器挪进别的机房。
+
+    手动登记的占位记录（origin='manual'）本身没有信息，表单会把这些字段留空，
+    提交时一次补齐即可；错误信息带「手动登记记录信息不完整：」前缀便于区分。
     """
     overrides = overrides or {}
     with db() as conn:
@@ -1710,25 +1845,43 @@ def restore_trash(trash_id, overrides=None, actor=""):
         raise ValueError("回收站记录不存在")
     serial = clean_value(row["serial_number"])
     records = read_records("servers")
-    if any(item["序列号"] == serial for item in records):
-        raise ValueError(f"序列号 {serial} 已在服务器表中，不能重复恢复")
+    headers = ENTITIES["servers"]["headers"]
+    picked = {key: value for key, value in overrides.items() if key in headers}
+    # 序列号也是可改字段：留空视为不改
+    new_serial = clean_value(picked.pop("序列号", "")) or serial
+    if new_serial == serial:
+        if any(item["序列号"] == serial for item in records):
+            raise ValueError(f"序列号 {serial} 已在服务器表中，不能重复恢复")
+    else:
+        if any(item["序列号"] == new_serial for item in records):
+            raise ValueError(f"序列号 {new_serial} 已在服务器表中，不能改用它")
+        with db() as conn:
+            duplicate = conn.execute(
+                "SELECT id FROM trash WHERE serial_number=? AND id<>?", (new_serial, trash_id)
+            ).fetchone()
+        if duplicate:
+            raise ValueError(f"序列号 {new_serial} 已在回收站中，不能改用它")
     snapshot = parse_json_dict(row["data"])
     manual = clean_value(dict(row).get("origin")) == TRASH_ORIGIN_MANUAL
-    if manual:
-        headers = ENTITIES["servers"]["headers"]
-        picked = {key: value for key, value in overrides.items() if key in headers}
-    else:
-        picked = {key: value for key, value in overrides.items() if key in snapshot or key in RESTORE_EDITABLE_FIELDS}
     merged = normalize_row("servers", {**snapshot, **picked})
-    merged["序列号"] = serial
+    merged["序列号"] = new_serial
     normalized, errors = validate_record("servers", merged)
     if errors:
         prefix = "手动登记记录信息不完整：" if manual else ""
         raise ValueError(prefix + "；".join(errors))
+    if room_scope and normalized["所在机房"] != clean_value(room_scope):
+        raise ValueError(f"只能恢复本机房的服务器（{clean_value(room_scope)}）")
     records.append(normalized)
     write_records("servers", records)
     with db() as conn:
         conn.execute("DELETE FROM trash WHERE id=?", (trash_id,))
+        if new_serial != serial and not any(item["序列号"] == serial for item in records):
+            # 附件按序列号归属：改名后随记录一起迁，旧序列号已不在服务器表里。
+            # 若旧序列号仍被别的服务器记录占用（历史脏数据），不动附件，避免抢走别人的档案。
+            conn.execute(
+                "UPDATE attachments SET serial_number=? WHERE serial_number=?",
+                (new_serial, serial),
+            )
         notify_audit_event(conn, {
             "event_type": "restored",
             "audit_type": "回收站",

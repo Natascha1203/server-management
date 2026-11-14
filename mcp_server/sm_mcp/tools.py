@@ -151,7 +151,11 @@ TOOL_SPECS = [
             "需再调 sm_review 通过才生效）。"
             "修改时 row 只需给要改的字段，工具会自动取回原记录合并后再提交；字段名以 sm_schema 为准。"
             "servers 的「接入行情」「接入柜台」是多值字段（见 sm_schema 的 multi_value_fields）："
-            "值可以传数组 [\"CTP行情\",\"Level-2\"]，也可以传 \"CTP行情, Level-2\"，服务端会去重归一。"
+            "值可以传数组 [\"CTP行情\",\"Level-2\"]，也可以传 \"CTP行情, Level-2\"，服务端会去重归一。\n"
+            "**占用机位（takeover）**：servers 的目标机位已被别的服务器占用时，默认会报错拦下。"
+            "确实要占（把原服务器整台下架到回收站）必须显式传 takeover=true，一次都不许多传——"
+            "这是会让别人机器下线的操作。原占用者按**整台**下架（哪怕只相交 1U），"
+            "且提交成功不代表已生效：非管理人员仍要走 sm_review。"
         ),
         "inputSchema": {
             "type": "object",
@@ -169,6 +173,14 @@ TOOL_SPECS = [
                         "不传 = 新增"
                     ),
                 },
+                "takeover": {
+                    "type": "boolean",
+                    "description": (
+                        "仅 servers 有效：目标机位被占用时是否占走它（原服务器整台下架进回收站）。"
+                        "默认 false = 按冲突报错。调用前先用 sm_query(cabinets) 或 sm_stats 确认机位上是谁，"
+                        "并在回复里说明将被下架的序列号。"
+                    ),
+                },
             },
             "required": ["entity", "row"],
             "additionalProperties": False,
@@ -178,10 +190,12 @@ TOOL_SPECS = [
     {
         "name": "sm_delete",
         "description": (
-            "删除记录。**后端没有回收站，删掉不可撤销**。"
+            "删除记录。**servers 删除会整行进回收站（可恢复）；cabinets / customers 删除不可撤销**。"
             "调用时必须同时传 keys 与 confirm_keys，两者内容必须完全相同，否则直接拒绝、一条都不删——"
             "这是强制的二次确认，防止手滑或误读上下文，不要尝试用不同参数绕过。"
             "管理员 token 下删除直接生效；其他身份只提交待审批申请。"
+            "只是想让新服务器占这个机位，不要用删除——用 sm_upsert(..., takeover=true) "
+            "或 sm_rack_review(..., takeover=true)，那才会正确留痕并进回收站。"
         ),
         "inputSchema": {
             "type": "object",
@@ -206,8 +220,9 @@ TOOL_SPECS = [
     {
         "name": "sm_pending",
         "description": (
-            "查看待审批的变更申请（id / 实体 / 操作 / 记录主键 / 提交人 / 时间）。"
+            "查看待审批的变更申请（id / 实体 / 操作 / 记录主键 / 是否占用机位 / 提交人 / 时间）。"
             "只有管理人员能拿到 change_id；其他身份调这个会降级成「待审批数据形态」的行视图。"
+            "「占用机位=是」的申请通过后会把该机位原有服务器整台下架进回收站，批准前先确认。"
             "审核用 sm_review。"
         ),
         "inputSchema": {
@@ -229,6 +244,7 @@ TOOL_SPECS = [
             "审核操作变更申请（仅管理人员）。approve 后数据才真正落库，reject 必须给 reason。"
             "ids 只有一条时走单条审核（可带 new_data 覆盖提交内容），多条走批量。"
             "**注意这是审批操作的唯一入口之一，动作不可撤销**。"
+            "先用 sm_pending 看清「占用机位」标记：带这个标记的申请通过后，目标机位上的原服务器会整台下架到回收站。"
         ),
         "inputSchema": {
             "type": "object",
@@ -274,6 +290,8 @@ TOOL_SPECS = [
             "审核上下架请求（管理人员全量 / 机房人员限本机房）。"
             "**stage 必须与请求的真实阶段一致**：工具会先查该请求的真实 stage，不一致直接中止且不产生任何变更。"
             "分配阶段（allocation）通过时要给 server_data（机位/IP）；实施阶段（implementation）上架与变更请求也可带 server_data 调整（变更以现有记录为底合并）。"
+            "目标机位已被别的服务器占用时，默认会被拦下；确实要占才传 takeover=true，"
+            "原服务器会**整台**下架到回收站（哪怕是上架还是变更、在哪个阶段）。"
             "驳回必须给 reason。"
         ),
         "inputSchema": {
@@ -287,6 +305,13 @@ TOOL_SPECS = [
                 },
                 "action": {"type": "string", "enum": ["approve", "reject"]},
                 "server_data": {"type": "object", "description": "机位/IP 等服务器字段，分配阶段通过时通常必填"},
+                "takeover": {
+                    "type": "boolean",
+                    "description": (
+                        "目标机位被占用时是否占走它（原服务器整台下架进回收站）。默认 false = 按冲突拦下。"
+                        "只在 action=approve 时有意义；调用前先 sm_rack_get 看清 server_data 里的机位归谁。"
+                    ),
+                },
                 "reason": {"type": "string", "description": "驳回原因，action=reject 时必填"},
             },
             "required": ["request_id", "stage", "action"],
@@ -696,10 +721,16 @@ def _upsert(client, args):
     row = _canonical_fields(headers, args.get("row"))
     old_key = args.get("old_key")
     is_update = old_key not in (None, "", {}, [])
+    # takeover 只对 servers 有意义；其他实体传了也忽略，别让它混进字段里
+    takeover = bool(args.get("takeover")) and entity == "servers"
 
     def run():
         if not is_update:
-            result = client.json("/api/%s/add" % entity, method="POST", payload=row)
+            # 新增也支持占用机位：takeover 是请求级参数，不能进 row（row 只放真实表头字段）
+            payload = dict(row)
+            if takeover:
+                payload["takeover"] = True
+            result = client.json("/api/%s/add" % entity, method="POST", payload=payload)
             return _write_result("新增", entity, _key_text(key_fields, row), result)
 
         old = _key_parts(key_fields, old_key, entity)
@@ -718,7 +749,10 @@ def _upsert(client, args):
         # 只给要改的字段即可：以服务端现有记录为底，避免 agent 回传 27 列还可能传错
         new = dict(current)
         new.update(row)
-        result = client.json("/api/%s/update" % entity, method="POST", payload={"old": old, "new": new})
+        payload = {"old": old, "new": new}
+        if takeover:
+            payload["takeover"] = True
+        result = client.json("/api/%s/update" % entity, method="POST", payload=payload)
         return _write_result("修改", entity, _key_text(key_fields, new), result)
 
     return _idempotent("sm_upsert", args, run)
@@ -800,6 +834,8 @@ def _pending(client, args):
         "实体": row.get("entity_label") or row.get("entity", ""),
         "操作": row.get("operation", ""),
         "记录主键": row.get("record_key", ""),
+        # 带这个标记的申请一旦通过，目标机位上的原服务器会整台下架进回收站
+        "占用机位": "是" if row.get("takeover") else "",
         "提交人": row.get("submitter", ""),
         "提交时间": row.get("submitted_at", ""),
     } for row in rows[:limit]]
@@ -809,8 +845,9 @@ def _pending(client, args):
     return (
         head
         + "\n\n"
-        + _table(brief, ["change_id", "实体", "操作", "记录主键", "提交人", "提交时间"])
+        + _table(brief, ["change_id", "实体", "操作", "记录主键", "占用机位", "提交人", "提交时间"])
         + '\n\n审核：sm_review(ids=["<change_id>"], action="approve")；驳回要给 reason。'
+        + "\n「占用机位=是」表示通过后该机位原有服务器会被整台下架到回收站，批准前先确认这是想要的结果。"
     )
 
 
@@ -916,11 +953,16 @@ def _rack_review(client, args):
         server_data = args.get("server_data")
         if isinstance(server_data, dict) and server_data:
             payload["server_data"] = server_data
+        # 占用意图随审核一起落库：分配阶段不传就分不到已被占用的机位，
+        # 实施阶段不传会按冲突拦下。驳回时不需要这个参数。
+        if args.get("takeover"):
+            payload["takeover"] = True
     result = client.json("/api/rack-requests/%s/review" % request_id, method="POST", payload=payload)
     return _dumps({
         "request_id": request_id,
         "stage": stage,
         "action": action,
+        "takeover": bool(args.get("takeover")) and action == "approve",
         "message": result.get("message", ""),
     })
 

@@ -1018,12 +1018,18 @@ function slotStatusText(slot) {
   return labels[slot.status] || '空闲';
 }
 
-function isSlotSelectable(slot) {
-  return slot.selectable !== false && slot.status !== 'occupied' && slot.status !== 'pending_occupied' && slot.status !== 'pending_implementation';
+function isSlotSelectable(slot, allowOccupied = false) {
+  // pending_* 是别的请求已锁定的资源（含交换在途），任何时候都不让抢
+  if (slot.status === 'pending_occupied' || slot.status === 'pending_implementation') return false;
+  // 正式占用：后端下发 selectable=false 表示「默认锁」，allowOccupied=true 是对它的显式覆盖
+  // （勾选占用模式 / 机位视图里点选已占用机位），选中即表示原服务器整台下架进回收站
+  if (slot.status === 'occupied') return allowOccupied || slot.selectable !== false;
+  return slot.selectable !== false;
 }
 
 function slotSelectableForRequest(slot, requestId) {
-  return isSlotSelectable(slot) || (requestId && slot.request_id === requestId);
+  // 上下架请求的机位视图里，已占用机位允许点选 —— 那就是「占用并下架原服务器」的入口
+  return isSlotSelectable(slot, true) || (requestId && slot.request_id === requestId);
 }
 
 function slotInfoText(slot) {
@@ -1052,6 +1058,7 @@ function renderServerForm(row) {
   const cabinets = rooms.find(x => x.name === initialRoom)?.cabinets || [];
   const initialCabinet = cabinets.find(x => x.name === row['所属机柜'])?.name || cabinets[0]?.name || '';
   state.slotPick = { start: null, end: null };
+  state.takeoverOwners = [];
   const selected = slotNumbers(row['所属机位']);
   if (selected.length) {
     state.slotPick.start = Math.max(...selected);
@@ -1071,7 +1078,9 @@ function renderServerForm(row) {
     <label>所在机房 *<select id="serverRoomSelect" name="所在机房"></select></label>
     <label>所属机柜 *<select id="serverCabinetSelect" name="所属机柜"></select></label>
     <label class="slot-value">所属机位 *<input id="serverSlotInput" name="所属机位" value="${esc(row['所属机位'] || '')}" readonly></label>
+    <label class="takeover-toggle"><input type="checkbox" id="takeoverToggle"> 占用模式：目标机位被占用时下架原服务器（不交换）</label>
     <div id="swapNotice" class="swap-notice" hidden></div>
+    <div id="takeoverNotice" class="takeover-notice" hidden></div>
     <div class="slot-picker" id="serverSlotPicker"></div>
   </div>`;
   const roomSelect = $('#serverRoomSelect');
@@ -1084,6 +1093,39 @@ function renderServerForm(row) {
     cabinetSelect.innerHTML = list.map(cabinet => `<option value="${esc(cabinet.name)}"${cabinet.name === selectedNameOrFirst ? ' selected' : ''}>${esc(cabinet.name)}</option>`).join('');
     renderSlotPicker();
   }
+  function takeoverMode() {
+    return !!$('#takeoverToggle')?.checked;
+  }
+  /** 当前选中机位里被正式服务器占用的那些序列号（占用模式下会被下架）。 */
+  function selectedTakeoverOwners() {
+    const room = rooms.find(x => x.name === roomSelect.value);
+    const cabinet = room?.cabinets.find(x => x.name === cabinetSelect.value);
+    const picked = slotNumbers($('#serverSlotInput').value || '');
+    if (!cabinet || !picked.length) return [];
+    const exclude = state.editing?.['序列号'] || '';
+    const owners = new Set();
+    cabinet.slots.forEach(slot => {
+      if (!picked.includes(Number(slot.slot))) return;
+      if (slot.status !== 'occupied' || !slot.server) return;
+      if (exclude && slot.server === exclude) return;
+      owners.add(slot.server);
+    });
+    return [...owners];
+  }
+  function renderTakeoverNotice() {
+    const el = $('#takeoverNotice');
+    const owners = takeoverMode() ? selectedTakeoverOwners() : [];
+    // 提交时要用：占用模式下会被下架的服务器序列号
+    state.takeoverOwners = owners;
+    if (!el) return;
+    if (!owners.length) {
+      el.hidden = true;
+      el.innerHTML = '';
+      return;
+    }
+    el.hidden = false;
+    el.innerHTML = `<span>⚠ 保存后将把 <b>${owners.map(esc).join('、')}</b> 整台下架并移入回收站</span>`;
+  }
   function renderSlotPicker() {
     const room = rooms.find(x => x.name === roomSelect.value);
     const cabinet = room?.cabinets.find(x => x.name === cabinetSelect.value);
@@ -1094,15 +1136,17 @@ function renderServerForm(row) {
     const swapRange = state.swapTarget && state.swapTarget.room === roomSelect.value && state.swapTarget.cabinet === cabinetSelect.value
       ? String(state.swapTarget.slots || state.swapTarget.slot) : null;
     const swapSlots = swapRange ? new Set(slotNumbers(swapRange).map(String)) : null;
+    const allowTakeover = takeoverMode();
     $('#serverSlotPicker').innerHTML = cabinet ? cabinet.slots.map(slot => {
       const num = Number(slot.slot);
       const selectedClass = selectedLow !== null && num >= selectedLow && num <= selectedHigh ? ' selected' : '';
       const swapClass = swapSlots && swapSlots.has(String(slot.slot)) ? ' swap-target' : '';
-      const usable = isSlotSelectable(slot);
+      const usable = isSlotSelectable(slot, allowTakeover);
       const locked = usable ? '' : (canSwapSlots() ? ' disabled swapable' : ' disabled');
+      const takeoverClass = allowTakeover && slot.status === 'occupied' ? ' takeover' : '';
       const info = slotInfoText(slot);
       const text = swapClass ? `交换→${slotStatusText(slot)}` : slotStatusText(slot);
-      return `<button class="slot-choice${selectedClass}${swapClass}${locked}" type="button" data-slot="${esc(slot.slot)}" data-slot-info="${esc(info)}" data-slot-status="${esc(slot.status || 'free')}" data-slot-owner="${esc(slot.server || '')}" data-slot-range="${esc(slot.owner_range || '')}" aria-disabled="${usable ? 'false' : 'true'}"><b>${esc(slot.slot)}</b><span>${esc(text)}</span></button>`;
+      return `<button class="slot-choice${selectedClass}${swapClass}${takeoverClass}${locked}" type="button" data-slot="${esc(slot.slot)}" data-slot-info="${esc(info)}" data-slot-status="${esc(slot.status || 'free')}" data-slot-owner="${esc(slot.server || '')}" data-slot-range="${esc(slot.owner_range || '')}" aria-disabled="${usable ? 'false' : 'true'}"><b>${esc(slot.slot)}</b><span>${esc(text)}</span></button>`;
     }).join('') : '<div class="empty">请先维护机柜信息</div>';
     $$('#serverSlotPicker .slot-choice').forEach(btn => {
       if (btn.classList.contains('disabled')) {
@@ -1113,6 +1157,7 @@ function renderServerForm(row) {
       btn.onclick = () => chooseSlot(Number(btn.dataset.slot));
     });
     renderSwapNotice();
+    renderTakeoverNotice();
   }
   function canSwapSlots() {
     return state.entity === 'servers' && !!state.editing;
@@ -1171,7 +1216,7 @@ function renderServerForm(row) {
     const high = Math.max(state.slotPick.start, slot);
     const busy = cabinet.slots.find(item => {
       const num = Number(item.slot);
-      return num >= low && num <= high && !isSlotSelectable(item);
+      return num >= low && num <= high && !isSlotSelectable(item, takeoverMode());
     });
     if (busy) {
       toast(`所选范围包含${slotStatusText(busy)}机位 ${busy.slot}`, true);
@@ -1191,6 +1236,13 @@ function renderServerForm(row) {
     state.slotPick = { start: null, end: null };
     state.swapTarget = null;
     $('#serverSlotInput').value = '';
+    renderSlotPicker();
+  };
+  const takeoverToggle = $('#takeoverToggle');
+  if (takeoverToggle) takeoverToggle.onchange = () => {
+    state.swapTarget = null;
+    $('#serverSlotInput').value = '';
+    state.slotPick = { start: null, end: null };
     renderSlotPicker();
   };
   renderCabinetSelect(initialCabinet);
@@ -1256,6 +1308,14 @@ $('#recordForm').onsubmit = async e => {
     const pending = state.pendingEditing;
     const url = pending ? `/api/changes/${pending._pending_change_id}/update-pending` : state.editing ? `/api/${state.entity}/update` : `/api/${state.entity}/add`;
     const body = pending ? { new_data: row } : state.editing ? { old: state.editing, new: row } : row;
+    // 占用模式：显式要求把目标机位上的原服务器整台下架（新增与修改都支持）
+    const takeoverOwners = state.takeoverOwners || [];
+    if (state.entity === 'servers' && !pending && takeoverOwners.length) {
+      const tail = state.editing ? '保存后该服务器整台下架并移入回收站，' : '保存后原服务器整台下架并移入回收站，新记录随即占用该机位。';
+      const ok = confirm(`目标机位已被 ${takeoverOwners.join('、')} 占用。\n${tail}\n确定继续？`);
+      if (!ok) return;
+      body.takeover = true;
+    }
     const d = await api(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
     toast(d.message);
     closeModal();
@@ -1505,8 +1565,10 @@ function renderRackSlotPicker(id) {
     const view = slot.request_id === id ? { ...slot, status: 'free', server: '', selectable: true } : slot;
     const selected = selectedLow !== null && num >= selectedLow && num <= selectedHigh ? ' selected' : '';
     const locked = slotSelectableForRequest(slot, id) ? '' : ' disabled';
+    // 已占用机位可点：选中即表示占用它，原服务器下架进回收站
+    const takeoverClass = slot.status === 'occupied' ? ' takeover' : '';
     const info = slotInfoText(view);
-    return `<button class="slot-choice${selected}${locked}" type="button" data-rack-slot="${esc(slot.slot)}" data-slot-info="${esc(info)}" aria-disabled="${locked ? 'true' : 'false'}"><b>${esc(slot.slot)}</b><span>${esc(slotStatusText(view))}</span></button>`;
+    return `<button class="slot-choice${selected}${locked}${takeoverClass}" type="button" data-rack-slot="${esc(slot.slot)}" data-slot-status="${esc(slot.status || 'free')}" data-slot-owner="${esc(slot.server || '')}" data-slot-info="${esc(info)}" aria-disabled="${locked ? 'true' : 'false'}"><b>${esc(slot.slot)}</b><span>${esc(slotStatusText(view))}</span></button>`;
   }).join('') : '<div class="empty">该机房暂无可分配机柜</div>';
   picker.querySelectorAll('[data-rack-slot]').forEach(btn => {
     if (btn.classList.contains('disabled')) {
@@ -1515,6 +1577,38 @@ function renderRackSlotPicker(id) {
     }
     btn.onclick = () => chooseRackSlot(id, Number(btn.dataset.rackSlot));
   });
+  renderRackTakeoverNotice(id);
+}
+
+/** 当前选中机位区间里，有哪些机位是被正式服务器占用的 -> 返回这些服务器序列号。 */
+function rackSelectedTakeoverOwners(id) {
+  const form = rackApprovalFormById(id);
+  if (!form) return [];
+  const item = state.rackRequests.find(row => row.id === id);
+  const cabinetName = form.querySelector('[data-rack-cabinet]')?.value || '';
+  const cabinet = roomCabinetsForRackRequest(item || {}).find(row => row.name === cabinetName);
+  const picked = slotNumbers(form.querySelector('[data-rack-slot-input]')?.value || '');
+  if (!cabinet || !picked.length) return [];
+  const owners = new Set();
+  cabinet.slots.forEach(slot => {
+    if (!picked.includes(Number(slot.slot))) return;
+    if (slot.status === 'occupied' && slot.server) owners.add(slot.server);
+  });
+  return [...owners];
+}
+
+/** 选中了已占用机位时给出明确警告：这些人会被下架进回收站。 */
+function renderRackTakeoverNotice(id) {
+  const box = rackApprovalFormById(id)?.querySelector('[data-rack-takeover-notice]');
+  if (!box) return;
+  const owners = rackSelectedTakeoverOwners(id);
+  if (!owners.length) {
+    box.hidden = true;
+    box.innerHTML = '';
+    return;
+  }
+  box.hidden = false;
+  box.innerHTML = `<span>⚠ 将占用已有服务器所在机位 <b>${owners.map(esc).join('、')}</b>：提交后该服务器整台下架并移入回收站</span>`;
 }
 
 function chooseRackSlot(id, slot) {
@@ -1701,6 +1795,7 @@ function rackApprovalForm(item) {
     <label>所属机柜 *<select name="所属机柜" data-rack-cabinet>${cabinetOptions}</select></label>
     <label>所属机位 *<input name="所属机位" value="${esc(draft['所属机位'])}" data-rack-slot-input${slotReadonly}></label>
     <div class="slot-picker" data-rack-slot-picker></div>
+    <div class="takeover-notice wide" data-rack-takeover-notice hidden></div>
     <div class="review-actions wide">${autoIpButton}<button class="btn danger" type="button" data-rack-action="reject">驳回</button><button class="btn primary" type="button" data-rack-action="approve">${approveText}</button></div>
   </form>`;
 }
@@ -1972,8 +2067,19 @@ async function reviewRackRequest(id, action) {
     body.reason = reason;
   }
   const item = state.rackRequests.find(row => row.id === id);
-  if (action === 'approve' && item?.request_type === '上架') {
-    body.server_data = collectRackApprovalData(id);
+  if (action === 'approve') {
+    // 选中了已被占用的机位 => 显式声明占用意图，后端会把原服务器整台下架进回收站
+    const owners = rackSelectedTakeoverOwners(id);
+    if (owners.length) {
+      const ok = confirm(
+        `机位已被 ${owners.join('、')} 占用。\n继续将把该服务器整台下架并移入回收站，确定占用该机位？`
+      );
+      if (!ok) return;
+      body.takeover = true;
+    }
+    if (item?.request_type === '上架') {
+      body.server_data = collectRackApprovalData(id);
+    }
   }
   try {
     const d = await api(`/api/rack-requests/${id}/review`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
@@ -1984,21 +2090,48 @@ async function reviewRackRequest(id, action) {
   }
 }
 
-/* ==== 回收站（仅管理人员）====
-   下架 / 删除的服务器整行进回收站；重新上架时可顺手改客户与机位，
-   冲突（客户未登记 / 机位被占）由后端拦下，请管理员先补登或腾位再来。
-   也可以手动登记一台只有序列号的服务器（origin=manual），信息等重新上架时再补。 */
-const TRASH_DETAIL_FIELDS = ['品牌', '型号', 'CPU型号', '网卡', '服务器成本(万)', '用途分类', '用途', '接入行情', '接入柜台', '管理ip', '交易ip', '带外ip', '上架时间', '备注'];
-const TRASH_RESTORE_FIELDS = [
-  ['客户id', '客户id'],
-  ['所在机房', '所在机房'],
-  ['所属机柜', '所属机柜'],
-  ['所属机位', '所属机位'],
-];
+/* ==== 回收站 ====
+   下架 / 删除 / 机位被占用的服务器整行进回收站；重新上架时整行字段都能改，
+   冲突（客户未登记 / 机位被占 / 序列号重复）由后端拦下，请先补登或腾位再来。
+   管理人员：全部记录，可手动登记（origin=manual）、重新上架、永久删除。
+   机房人员：只看本机房，可查看与重新上架；永久删除与手动登记仍归管理人员。 */
+
+// 这些字段给个填写样例，避免手填格式错（后端仍按服务器表规则校验）
+const TRASH_FIELD_HINTS = {
+  '序列号': '可修改；改名后资料附件一起跟着走',
+  '所在机房': '必须是机柜表已登记的机房',
+  '所属机柜': '必须是该机房已登记的机柜',
+  '所属机位': '区间格式，如 18-19',
+  '管理ip': 'IPv4 或 CIDR，如 10.71.141.213/25',
+  '交易ip': 'IPv4 或 CIDR',
+  '带外ip': 'IPv4 或 CIDR',
+};
+
+function trashFieldInput(field, item) {
+  const value = item[field] || '';
+  if (field === '客户id' || field === '客户名称') {
+    return `<label>${esc(field)}${customerInput(field, value)}</label>`;
+  }
+  const hint = TRASH_FIELD_HINTS[field];
+  const extra = hint ? ` placeholder="${esc(hint)}"` : '';
+  const required = field === '序列号' ? ' *' : '';
+  return `<label${fieldLabelClass(field)}>${esc(field)}${required}${textFieldInput(field, value, extra)}</label>`;
+}
+
+function trashHeaders() {
+  // 字段清单来自后端 /api/trash 的 headers（= 服务器表全部列），保证不脱节
+  return (state.trashHeaders && state.trashHeaders.length) ? state.trashHeaders : SERVER_APPROVAL_HEADERS;
+}
 
 function trashDetails(item) {
-  const details = Object.fromEntries(TRASH_DETAIL_FIELDS.map(field => [field, item[field] || '']).filter(([, value]) => String(value).trim()));
+  const details = Object.fromEntries(
+    trashHeaders().map(field => [field, item[field] || '']).filter(([, value]) => String(value).trim())
+  );
   return pretty(details);
+}
+
+function canPurgeTrash() {
+  return state.trashCanManage !== false && isAdmin();
 }
 
 function trashCard(item) {
@@ -2007,23 +2140,28 @@ function trashCard(item) {
   const location = [item['所在机房'], item['所属机柜'], item['所属机位']].filter(Boolean).join(' / ');
   const manual = item.origin === 'manual';
   const expanded = state.trashExpanded.includes(item.id);
-  const inputs = TRASH_RESTORE_FIELDS.map(([label, field]) =>
-    `<label>${esc(label)}<input name="${esc(field)}" value="${esc(item[field] || '')}"></label>`).join('');
+  const inputs = trashHeaders().map(field => trashFieldInput(field, item)).join('');
   const head = `<div class="review-top rack-request-head" data-trash-expand-id="${esc(item.id)}" title="点击展开/收起">${manual ? '<span class="tag">手动登记</span>' : ''}<strong>${esc(serial)}</strong><span class="muted">${esc(location || '未记录位置')}</span>${customer ? `<span class="muted">· ${esc(customer)}</span>` : ''}<span class="review-time">${esc(item.deleted_at || '')}${item.deleted_by ? ' · ' + esc(item.deleted_by) : ''}</span><span class="rack-caret">${expanded ? '▾' : '▸'}</span></div>`;
   const recordBlock = manual
-    ? '<div class="diff compact"><div class="diff-box"><b>手动登记</b><p class="muted">这条记录只有序列号，补齐下面的客户与机位后再点「重新上架」。</p></div></div>'
-    : `<div class="diff compact"><div class="diff-box"><b>删除时记录</b>${trashDetails(item)}</div></div>`;
+    ? '<div class="diff compact"><div class="diff-box"><b>手动登记</b><p class="muted">这条记录只有序列号，补齐下面任意字段后再点「重新上架」。</p></div></div>'
+    : `<details class="diff compact"><summary><b>删除时记录（只读）</b></summary><div class="diff-box">${trashDetails(item)}</div></details>`;
+  const purgeBtn = canPurgeTrash()
+    ? '<button class="btn danger" type="button" data-trash-action="purge">永久删除</button>'
+    : '';
+  const hint = canPurgeTrash()
+    ? '重新上架会按服务器表重新校验：客户必须已登记、机房机柜机位必须在机柜表范围内、机位与 IP 不得被占用。改序列号时该序列号的资料附件会一起迁到新序列号。永久删除会连带清掉资料附件，不可恢复。'
+    : '重新上架会按服务器表重新校验：客户必须已登记、机房机柜机位必须在机柜表范围内、机位与 IP 不得被占用。冲突时请先补登客户或腾出机位。';
   const body = `<div class="rack-request-body"${expanded ? '' : ' hidden'}>
     ${recordBlock}
     ${item.reason ? `<p class="muted">来源：${esc(item.reason)}</p>` : ''}
     <div class="trash-restore-form form-grid" data-trash-restore="${esc(item.id)}">
       ${inputs}
       <div class="review-actions wide">
-        <button class="btn danger" type="button" data-trash-action="purge">永久删除</button>
+        ${purgeBtn}
         <button class="btn primary" type="button" data-trash-action="restore">重新上架</button>
       </div>
     </div>
-    <p class="muted">重新上架会按机柜表校验客户、机位与 IP 占用；永久删除会连带清掉该序列号的资料附件，不可恢复。</p>
+    <p class="muted">${hint}</p>
   </div>`;
   return `<article class="review-card rack-request-card">${head}${body}</article>`;
 }
@@ -2063,6 +2201,8 @@ function bindTrashActions() {
       ? restoreTrashItem(id, button)
       : purgeTrashItem(id);
   });
+  // 客户id / 客户名称 双向联动（datalist 选项由 loadTrash 预先加载）
+  $$('#trashList [data-trash-restore]').forEach(form => bindCustomerInputs(form));
 }
 
 function bindTrashAddForm() {
@@ -2095,8 +2235,18 @@ async function loadTrash() {
   if (!$('#trashList')) return;
   bindTrashAddForm();
   try {
+    // 客户 datalist 与标签候选池：回收站表单要能编辑整行字段，先把选项备好
+    await Promise.all([
+      loadCustomerOptions().catch(() => {}),
+      Object.keys(state.fieldOptions || {}).length ? null : loadFieldOptions(),
+    ]);
     const d = await api('/api/trash');
     state.trash = d.items || [];
+    state.trashHeaders = d.headers || [];
+    state.trashCanManage = d.can_manage !== false;
+    // 手动登记只有管理人员能做，机房人员看到表单只会 403
+    const addForm = $('#trashAddForm');
+    if (addForm) addForm.hidden = !canPurgeTrash();
     renderTrash();
   } catch (e) {
     toast(e.message, true);
@@ -3022,5 +3172,5 @@ if ($('#addSystemUserBtn')) $('#addSystemUserBtn').onclick = () => {
 if ($('#saveSystemUsersBtn')) $('#saveSystemUsersBtn').onclick = saveSystemUsers;
 applyCapabilityVisibility();
 loadEntity().catch(e => toast(e.message, true));
-if (isAdmin() && $('#trashBadge')) loadTrash().catch(() => {});
+if (hasCapability('view_trash') && $('#trashBadge')) loadTrash().catch(() => {});
 if (APP_ROLE === 'admin') refreshBadge();
