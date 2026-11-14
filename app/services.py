@@ -1784,9 +1784,11 @@ def complete_rack_request(conn, row, user, server_data=None, takeover=False):
 #   2. 页面上的「删除 / 批量删除」（approve_change 的删除分支）——同上
 #   3. 回收站里手动登记（add_manual_trash_server）——只有序列号，其余字段等上架时补
 #   4. 上架/变更占用已有机位（takeover）——原占用者整台下架，reason=机位被占用
-# 管理人员可查看 / 重新上架 / 永久删除；机房人员只看本机房，可查看与重新上架。
+# 管理人员可查看 / 手动登记 / 修改信息 / 重新上架 / 永久删除；
+# 机房人员只看本机房，可查看、修改信息与重新上架。
 # 永久删除会连带清掉该序列号的资料附件。
-# 重新上架时可以改**整行任意字段**（含序列号）：改序列号时该序列号的资料附件一起改名。
+# 修改信息（update_trash）只更新回收站里的快照，不上架、不做完整校验；
+# 重新上架（restore_trash）才写回服务器表并整行校验，可以改**整行任意字段**（含序列号）。
 
 TRASH_REASON_RACK_DOWN = "下架实施完成"
 TRASH_REASON_DELETE = "删除操作（未走上下架流程）"
@@ -1899,6 +1901,72 @@ def trash_to_json(row):
         "origin": dict(row).get("origin", ""),
     })
     return item
+
+
+def update_trash(trash_id, overrides=None, actor="", room_scope=""):
+    """只改回收站里的这条记录并保存，**不**写回服务器表（不上架）。
+
+    与 restore_trash 的分工：
+    - 这里不做完整服务器校验。回收站里的记录本来就可能是「客户未登记 / 机位被占」
+      被挡下来的，或是手动登记的信息不全草稿——只维护信息不该被这些拦住，
+      完整校验仍然发生在「重新上架」那一刻。
+    - 只挡硬冲突：序列号不能为空，且不能与服务器表 / 回收站其它记录重复。
+
+    overrides 为整行字段（只取服务器表的 header），序列号留空视为不改；改序列号时
+    该序列号的资料附件一起迁到新序列号，避免回收站里记录与附件对不上。
+    room_scope 非空表示调用方只能维护该机房的记录，改完「所在机房」仍须是本机房。
+    """
+    overrides = overrides or {}
+    with db() as conn:
+        row = conn.execute("SELECT * FROM trash WHERE id=?", (trash_id,)).fetchone()
+    if not row:
+        raise ValueError("回收站记录不存在")
+    serial = clean_value(row["serial_number"])
+    snapshot = parse_json_dict(row["data"])
+    if room_scope and clean_value(snapshot.get("所在机房")) != clean_value(room_scope):
+        raise ValueError(f"只能维护本机房的服务器（{clean_value(room_scope)}）")
+    headers = ENTITIES["servers"]["headers"]
+    picked = {key: value for key, value in overrides.items() if key in headers}
+    new_serial = clean_value(picked.pop("序列号", "")) or serial
+    if new_serial != serial:
+        if any(clean_value(item.get("序列号")) == new_serial for item in read_records("servers")):
+            raise ValueError(f"序列号 {new_serial} 已在服务器表中，不能改用它")
+        with db() as conn:
+            duplicate = conn.execute(
+                "SELECT id FROM trash WHERE serial_number=? AND id<>?", (new_serial, trash_id)
+            ).fetchone()
+        if duplicate:
+            raise ValueError(f"序列号 {new_serial} 已在回收站中，不能改用它")
+    merged = normalize_row("servers", {**snapshot, **picked})
+    merged["序列号"] = new_serial
+    if room_scope and clean_value(merged.get("所在机房")) != clean_value(room_scope):
+        raise ValueError(f"只能维护本机房的服务器（{clean_value(room_scope)}），不能把记录改到别的机房")
+    with db() as conn:
+        conn.execute(
+            "UPDATE trash SET serial_number=?, data=? WHERE id=?",
+            (new_serial, json.dumps(merged, ensure_ascii=False), trash_id),
+        )
+        if new_serial != serial and not any(
+            clean_value(item.get("序列号")) == serial for item in read_records("servers")
+        ):
+            # 附件按序列号归属：改名后随记录一起走。
+            # 若旧序列号仍被别的服务器占用（历史脏数据），不动附件，避免抢走别人的档案。
+            conn.execute(
+                "UPDATE attachments SET serial_number=? WHERE serial_number=?",
+                (new_serial, serial),
+            )
+        notify_audit_event(conn, {
+            "event_type": "trash_updated",
+            "audit_type": "回收站",
+            "title": "回收站记录信息已修改",
+            "entity_label": "服务器",
+            "operation": "修改信息",
+            "record_key": new_serial,
+            "reviewer": actor,
+            "time": now_text(),
+            "summary": summarize_record(merged, ["序列号", "客户名称", "所在机房", "所属机柜", "所属机位"]),
+        })
+    return merged
 
 
 def restore_trash(trash_id, overrides=None, actor="", room_scope=""):

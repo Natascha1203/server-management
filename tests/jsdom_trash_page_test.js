@@ -5,6 +5,7 @@
  * 3. 手动登记记录（origin=manual）在卡片上带「手动登记」标签，展开后提示补齐信息
  * 4. 下架/删除快照仍显示「删除时记录」与来源
  * 5. 重新上架表单覆盖服务器整行字段（含序列号），提交时把改动一起发回后端
+ * 6. 「保存修改」只 PATCH 回收站记录（不上架），保存后仍留在列表且保持展开
  */
 const fs = require('fs');
 const path = require('path');
@@ -44,6 +45,12 @@ function fakeFetch(url, opt = {}) {
   requests.push({ url: String(url), method: (opt.method || 'GET').toUpperCase(), body: opt.body || '' });
   if (String(url).includes('/restore')) {
     return Promise.resolve({ ok: true, json: () => Promise.resolve({ message: '序列号 SN-DOWN 已重新上架', record: {} }) });
+  }
+  if (String(url) === '/api/trash/t-down' && (opt.method || '').toUpperCase() === 'PATCH') {
+    return Promise.resolve({
+      ok: true,
+      json: () => Promise.resolve({ message: '序列号 SN-DOWN 的信息已保存（仍在回收站）', record: {} }),
+    });
   }
   if (String(url) === '/api/trash' && (opt.method || '').toUpperCase() === 'POST') {
     return Promise.resolve({
@@ -140,17 +147,37 @@ async function main() {
     downCard.querySelector('[name="备注"]')?.tagName);
   check('T4 删除时记录默认收起',
     downCard.querySelector('details.diff') && !downCard.querySelector('details.diff').open);
+  check('T4 卡片有「保存修改」按钮', !!downCard.querySelector('[data-trash-action="save"]'));
 
-  // 改序列号 + 改品牌后提交，检查请求体带上了新值
+  // 改序列号 + 品牌 + 备注后先「保存修改」（不上架）
   downCard.querySelector('[name="序列号"]').value = 'SN-DOWN-NEW';
   downCard.querySelector('[name="品牌"]').value = 'HPE';
-  downCard.querySelector('[data-trash-action="restore"]').click();
+  downCard.querySelector('[name="备注"]').value = '等客户确认后再上架';
+  downCard.querySelector('[data-trash-action="save"]').click();
+  await tick(40);
+
+  // ===== T5: 保存修改 =====
+  const saveReq = requests.find(r => r.url === '/api/trash/t-down' && r.method === 'PATCH');
+  check('T5 保存修改调用 PATCH /api/trash/<id>', !!saveReq, requests.map(r => r.method + ' ' + r.url).join(' | '));
+  const saved = saveReq ? JSON.parse(saveReq.body).server_data : {};
+  check('T5 请求体带新序列号', saved['序列号'] === 'SN-DOWN-NEW', saved['序列号']);
+  check('T5 请求体带改后的品牌', saved['品牌'] === 'HPE', saved['品牌']);
+  check('T5 请求体带多行备注', saved['备注'] === '等客户确认后再上架', saved['备注']);
+  check('T5 保存不触发重新上架', !requests.some(r => r.url.includes('/restore')));
+  check('T5 保存后记录仍在回收站',
+    $$('#trashList .review-card').length === 2, String($$('#trashList .review-card').length));
+  const keptCard = $$('#trashList .review-card').find(c => c.textContent.includes('SN-DOWN'));
+  check('T5 保存后卡片保持展开',
+    !!keptCard && !keptCard.querySelector('.rack-request-body').hidden);
+
+  // ===== T6: 重新上架（保存之后仍然可以走这条路）=====
+  keptCard.querySelector('[name="品牌"]').value = 'Lenovo';
+  keptCard.querySelector('[data-trash-action="restore"]').click();
   await tick(40);
   const restoreReq = requests.find(r => r.url === '/api/trash/t-down/restore' && r.method === 'POST');
-  check('T4 重新上架调用 restore 接口', !!restoreReq, restoreReq?.url);
+  check('T6 重新上架调用 restore 接口', !!restoreReq, restoreReq?.url);
   const sent = restoreReq ? JSON.parse(restoreReq.body).server_data : {};
-  check('T4 请求体带新序列号', sent['序列号'] === 'SN-DOWN-NEW', sent['序列号']);
-  check('T4 请求体带改后的品牌', sent['品牌'] === 'HPE', sent['品牌']);
+  check('T6 请求体带改后的品牌', sent['品牌'] === 'Lenovo', sent['品牌']);
 
   console.log('RESULT: ' + passed + ' passed, ' + failures.length + ' failed');
   if (failures.length) {

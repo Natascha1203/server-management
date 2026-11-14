@@ -1463,8 +1463,9 @@ def review_rack_request(request_id):
 # ---------------------------------------------------------------- 回收站
 # 服务器整行进回收站有四个入口：下架实施完成、页面删除/批量删除、回收站手动登记、
 # 上架/变更时占用已有机位（原占用者自动下架）。
-# 管理人员：全部记录，可查看 / 手动登记 / 重新上架 / 永久删除。
-# 机房人员：只看本机房，可查看与重新上架；手动登记与永久删除仍归管理人员。
+# 管理人员：全部记录，可查看 / 手动登记 / 修改信息 / 重新上架 / 永久删除。
+# 机房人员：只看本机房，可查看、修改信息与重新上架；手动登记与永久删除仍归管理人员。
+# 「修改信息」只更新回收站里的快照，不上架；「重新上架」才写回服务器表并整行校验。
 
 @bp.get("/api/trash")
 @require_login
@@ -1500,6 +1501,31 @@ def add_trash_api():
     except ValueError as exc:
         return jsonify(error=str(exc)), 400
     return jsonify(message=f"序列号 {serial} 已加入回收站，重新上架时再补齐信息", id=trash_id)
+
+
+@bp.patch("/api/trash/<trash_id>")
+@require_login
+def update_trash_api(trash_id):
+    """只修改回收站里的记录并保存，不上架；让服务器重新上架请走 /restore。
+
+    保存阶段不做完整服务器校验（客户/机位/IP 冲突留到上架那一刻判），
+    所以这里只挡序列号为空 / 与服务器表或回收站其它记录重复。
+    """
+    user = current_user()
+    if "view_trash" not in capabilities_for(user):
+        return forbidden()
+    room_scope = user["所属机房"] if user["身份"] == ROLE_ROOM else ""
+    if room_scope and services.trash_entry(trash_id, room=room_scope) is None:
+        return forbidden()
+    body = request.get_json(silent=True) or {}
+    try:
+        with storage.LOCK:
+            record = services.update_trash(
+                trash_id, body.get("server_data") or {}, actor=user["用户id"], room_scope=room_scope,
+            )
+    except ValueError as exc:
+        return jsonify(error=str(exc)), 400
+    return jsonify(message=f"序列号 {record['序列号']} 的信息已保存（仍在回收站）", record=record)
 
 
 @bp.post("/api/trash/<trash_id>/restore")

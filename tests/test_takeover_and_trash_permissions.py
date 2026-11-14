@@ -383,6 +383,109 @@ class TestSameSerialReplacement:
         assert trash_serials() == set()
 
 
+class TestTrashUpdate:
+    """回收站「保存修改」：只更新快照并留在回收站，不做完整服务器校验。"""
+
+    def _move_down(self, client, serial="SRV-DOWN"):
+        add_official("servers", {
+            "序列号": serial, "客户id": "1", "所在机房": "机房A", "所属机柜": "C1",
+            "所属机位": "7-8", "管理ip": "10.1.1.30/24", "带外ip": "10.1.3.30/24",
+            "品牌": "HPE", "备注": "待上架",
+        })
+        client.post("/api/servers/delete", json={"序列号": serial})
+        return next(row["id"] for row in services.trash_rows() if row["serial_number"] == serial)
+
+    def test_saves_fields_without_restoring(self, app_env, admin):
+        client = setup_base(app_env)
+        login(client)
+        trash_id = self._move_down(client)
+
+        resp = client.patch(f"/api/trash/{trash_id}", json={"server_data": {
+            "品牌": "Dell", "型号": "R750", "所属机位": "9-10",
+        }})
+        assert resp.status_code == 200
+        assert "仍在回收站" in resp.get_json()["message"]
+        # 服务器表不动，记录还在回收站
+        assert "SRV-DOWN" not in {row["序列号"] for row in storage.read_records("servers")}
+        assert "SRV-DOWN" in trash_serials()
+        item = services.trash_entry(trash_id)
+        assert (item["品牌"], item["型号"], item["所属机位"]) == ("Dell", "R750", "9-10")
+        # 没提交的字段保留快照原值
+        assert item["备注"] == "待上架"
+
+    def test_saves_draft_that_would_fail_restore(self, app_env, admin):
+        """客户未登记 / 机房越界也能先保存下来；完整校验留到重新上架那一刻。"""
+        client = setup_base(app_env)
+        login(client)
+        trash_id = self._move_down(client)
+
+        resp = client.patch(f"/api/trash/{trash_id}", json={"server_data": {
+            "客户id": "999", "所在机房": "机房Z", "所属机柜": "C9", "所属机位": "99-100",
+        }})
+        assert resp.status_code == 200
+        assert services.trash_entry(trash_id)["客户id"] == "999"
+
+        blocked = client.post(f"/api/trash/{trash_id}/restore", json={})
+        assert blocked.status_code == 400
+        assert "SRV-DOWN" in trash_serials()
+
+    def test_change_serial_moves_attachments(self, app_env, admin):
+        client = setup_base(app_env)
+        login(client)
+        trash_id = self._move_down(client)
+        with storage.db() as conn:
+            conn.execute(
+                "INSERT INTO attachments (id,serial_number,filename,stored_name,size,uploader,uploaded_at)"
+                " VALUES (?,?,?,?,?,?,?)",
+                ("att1", "SRV-DOWN", "a.pdf", "stored-a.pdf", 12, "admin", "2026-11-14 10:00:00"),
+            )
+
+        resp = client.patch(f"/api/trash/{trash_id}", json={"server_data": {"序列号": "SRV-RENAMED"}})
+        assert resp.status_code == 200
+        item = services.trash_entry(trash_id)
+        assert item["serial_number"] == "SRV-RENAMED"
+        assert item["序列号"] == "SRV-RENAMED"
+        with storage.db() as conn:
+            row = conn.execute("SELECT serial_number FROM attachments WHERE id='att1'").fetchone()
+        assert row["serial_number"] == "SRV-RENAMED"
+
+    def test_blank_serial_keeps_original(self, app_env, admin):
+        client = setup_base(app_env)
+        login(client)
+        trash_id = self._move_down(client)
+        resp = client.patch(f"/api/trash/{trash_id}", json={"server_data": {"序列号": "", "品牌": "Lenovo"}})
+        assert resp.status_code == 200
+        item = services.trash_entry(trash_id)
+        assert item["serial_number"] == "SRV-DOWN"
+        assert item["品牌"] == "Lenovo"
+
+    def test_rejects_serial_used_by_server(self, app_env, admin):
+        client = setup_base(app_env)
+        login(client)
+        trash_id = self._move_down(client)
+        resp = client.patch(f"/api/trash/{trash_id}", json={"server_data": {"序列号": "SRV-OLD"}})
+        assert resp.status_code == 400
+        assert "服务器表" in resp.get_json()["error"]
+        assert services.trash_entry(trash_id)["serial_number"] == "SRV-DOWN"
+
+    def test_rejects_serial_used_by_other_trash_entry(self, app_env, admin):
+        client = setup_base(app_env)
+        login(client)
+        trash_id = self._move_down(client)
+        assert client.post("/api/trash", json={"序列号": "SRV-MANUAL"}).status_code == 200
+
+        resp = client.patch(f"/api/trash/{trash_id}", json={"server_data": {"序列号": "SRV-MANUAL"}})
+        assert resp.status_code == 400
+        assert "回收站" in resp.get_json()["error"]
+
+    def test_missing_entry_returns_400(self, app_env, admin):
+        client = setup_base(app_env)
+        login(client)
+        resp = client.patch("/api/trash/not-exist", json={"server_data": {"品牌": "X"}})
+        assert resp.status_code == 400
+        assert "不存在" in resp.get_json()["error"]
+
+
 class TestTrashSnapshotCompleteness:
     def test_snapshot_holds_all_server_headers(self, app_env, admin):
         client = setup_base(app_env)
@@ -490,6 +593,62 @@ class TestRoomUserTrashAccess:
         assert resp.status_code == 400
         assert "本机房" in resp.get_json()["error"]
         assert "SRV-A1" not in {row["序列号"] for row in storage.read_records("servers")}
+
+    def test_room_can_save_own_room_record(self, app_env, admin, room_user):
+        """机房人员也能改本机房记录的信息并保存（不上架）。"""
+        admin_client = setup_base(app_env)
+        login(admin_client)
+        self._seed(admin_client, admin_client)
+
+        client = app_env["app"].test_client()
+        login(client, "room1")
+        items = client.get("/api/trash").get_json()["items"]
+        target = next(item for item in items if item["serial_number"] == "SRV-A1")
+        resp = client.patch(f"/api/trash/{target['id']}", json={"server_data": {
+            "品牌": "HPE", "型号": "DL380", "备注": "机房补录",
+        }})
+        assert resp.status_code == 200
+        item = services.trash_entry(target["id"])
+        assert (item["品牌"], item["型号"], item["备注"]) == ("HPE", "DL380", "机房补录")
+        # 只改快照，没上架
+        assert "SRV-A1" not in {row["序列号"] for row in storage.read_records("servers")}
+
+    def test_room_cannot_save_record_into_other_room(self, app_env, admin, room_user):
+        admin_client = setup_base(app_env)
+        login(admin_client)
+        self._seed(admin_client, admin_client)
+
+        client = app_env["app"].test_client()
+        login(client, "room1")
+        items = client.get("/api/trash").get_json()["items"]
+        target = next(item for item in items if item["serial_number"] == "SRV-A1")
+        resp = client.patch(f"/api/trash/{target['id']}", json={"server_data": {"所在机房": "机房B"}})
+        assert resp.status_code == 400
+        assert "本机房" in resp.get_json()["error"]
+        assert services.trash_entry(target["id"])["所在机房"] == "机房A"
+
+    def test_room_cannot_save_other_room_record(self, app_env, admin, room_user):
+        admin_client = setup_base(app_env)
+        login(admin_client)
+        self._seed(admin_client, admin_client)
+
+        admin_items = admin_client.get("/api/trash").get_json()["items"]
+        other = next(item for item in admin_items if item["serial_number"] == "SRV-B1")
+
+        client = app_env["app"].test_client()
+        login(client, "room1")
+        resp = client.patch(f"/api/trash/{other['id']}", json={"server_data": {"品牌": "X"}})
+        assert resp.status_code == 403
+
+    def test_business_user_cannot_save(self, app_env, admin, biz_user):
+        admin_client = setup_base(app_env)
+        login(admin_client)
+        self._seed(admin_client, admin_client)
+        target = admin_client.get("/api/trash").get_json()["items"][0]
+
+        client = app_env["app"].test_client()
+        login(client, "biz1")
+        assert client.patch(f"/api/trash/{target['id']}", json={"server_data": {"品牌": "X"}}).status_code == 403
 
     def test_room_cannot_purge_or_add(self, app_env, admin, room_user):
         admin_client = setup_base(app_env)

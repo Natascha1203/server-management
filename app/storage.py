@@ -146,8 +146,9 @@ ATTACHMENTS_SCHEMA = """CREATE TABLE IF NOT EXISTS attachments (
 # 回收站：服务器整行快照暂存处，来源有两类——
 #   origin=''       来自服务器表（下架实施完成 / 直接删除）
 #   origin='manual' 回收站里手动登记，只有序列号，其余字段等重新上架时补
-# 管理人员可看/恢复/永久删除，机房人员限本机房（可看/可恢复）；
-# 重新上架时整行字段都能改（含序列号，改名后附件跟着迁）。
+# 管理人员可看/改/恢复/永久删除，机房人员限本机房（可看/可改/可恢复）；
+# 「修改信息」只更新 data 快照（不上架、不做完整校验）；「重新上架」才写回服务器表
+# 并按服务器表整行校验。两处都能改整行字段（含序列号，改名后附件跟着迁）。
 TRASH_SCHEMA = """CREATE TABLE IF NOT EXISTS trash (
     id TEXT PRIMARY KEY,
     serial_number TEXT NOT NULL,

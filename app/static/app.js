@@ -2109,10 +2109,11 @@ async function reviewRackRequest(id, action) {
 }
 
 /* ==== 回收站 ====
-   下架 / 删除 / 机位被占用的服务器整行进回收站；重新上架时整行字段都能改，
-   冲突（客户未登记 / 机位被占 / 序列号重复）由后端拦下，请先补登或腾位再来。
-   管理人员：全部记录，可手动登记（origin=manual）、重新上架、永久删除。
-   机房人员：只看本机房，可查看与重新上架；永久删除与手动登记仍归管理人员。 */
+   下架 / 删除 / 机位被占用的服务器整行进回收站；记录里的整行字段都能改：
+   「保存修改」只更新回收站里的这条记录（不上架、不做完整校验），
+   「重新上架」才写回服务器表，并按机柜表校验客户 / 机位 / IP 占用。
+   管理人员：全部记录，可手动登记（origin=manual）、改信息、重新上架、永久删除。
+   机房人员：只看本机房，可改信息与重新上架；永久删除与手动登记仍归管理人员。 */
 
 // 这些字段给个填写样例，避免手填格式错（后端仍按服务器表规则校验）
 const TRASH_FIELD_HINTS = {
@@ -2161,22 +2162,23 @@ function trashCard(item) {
   const inputs = trashHeaders().map(field => trashFieldInput(field, item)).join('');
   const head = `<div class="review-top rack-request-head" data-trash-expand-id="${esc(item.id)}" title="点击展开/收起">${manual ? '<span class="tag">手动登记</span>' : ''}<strong>${esc(serial)}</strong><span class="muted">${esc(location || '未记录位置')}</span>${customer ? `<span class="muted">· ${esc(customer)}</span>` : ''}<span class="review-time">${esc(item.deleted_at || '')}${item.deleted_by ? ' · ' + esc(item.deleted_by) : ''}</span><span class="rack-caret">${expanded ? '▾' : '▸'}</span></div>`;
   const recordBlock = manual
-    ? '<div class="diff compact"><div class="diff-box"><b>手动登记</b><p class="muted">这条记录只有序列号，补齐下面任意字段后再点「重新上架」。</p></div></div>'
+    ? '<div class="diff compact"><div class="diff-box"><b>手动登记</b><p class="muted">这条记录只有序列号，补齐下面任意字段后可以先「保存修改」，也可以直接「重新上架」。</p></div></div>'
     : `<details class="diff compact"><summary><b>删除时记录（只读）</b></summary><div class="diff-box">${trashDetails(item)}</div></details>`;
   const purgeBtn = canPurgeTrash()
     ? '<button class="btn danger" type="button" data-trash-action="purge">永久删除</button>'
     : '';
   const hint = canPurgeTrash()
-    ? '重新上架会按服务器表重新校验：客户必须已登记、机房机柜机位必须在机柜表范围内、机位与 IP 不得被占用。改序列号时该序列号的资料附件会一起迁到新序列号。永久删除会连带清掉资料附件，不可恢复。'
-    : '重新上架会按服务器表重新校验：客户必须已登记、机房机柜机位必须在机柜表范围内、机位与 IP 不得被占用。冲突时请先补登客户或腾出机位。';
+    ? '「保存修改」只更新回收站里的这条记录，不会上架；「重新上架」才写回服务器表，并校验客户已登记、机房机柜机位在范围内、机位与 IP 未被占用。改序列号时该序列号的资料附件会一起迁到新序列号。永久删除会连带清掉资料附件，不可恢复。'
+    : '「保存修改」只更新回收站里的这条记录，不会上架；「重新上架」才写回服务器表，并校验客户已登记、机房机柜机位在范围内、机位与 IP 未被占用。冲突时请先补登客户或腾出机位。';
   const body = `<div class="rack-request-body"${expanded ? '' : ' hidden'}>
     ${recordBlock}
     ${item.reason ? `<p class="muted">来源：${esc(item.reason)}</p>` : ''}
     <div class="trash-restore-form form-grid" data-trash-restore="${esc(item.id)}">
       ${inputs}
       <div class="review-actions wide">
-        ${purgeBtn}
+        <button class="btn" type="button" data-trash-action="save">保存修改</button>
         <button class="btn primary" type="button" data-trash-action="restore">重新上架</button>
+        ${purgeBtn}
       </div>
     </div>
     <p class="muted">${hint}</p>
@@ -2215,9 +2217,12 @@ function bindTrashActions() {
   $$('#trashList [data-trash-action]').forEach(button => {
     const id = button.closest('[data-trash-restore]')?.dataset.trashRestore;
     if (!id) return;
-    button.onclick = () => button.dataset.trashAction === 'restore'
-      ? restoreTrashItem(id, button)
-      : purgeTrashItem(id);
+    const action = button.dataset.trashAction;
+    button.onclick = () => {
+      if (action === 'restore') return restoreTrashItem(id, button);
+      if (action === 'save') return saveTrashItem(id, button);
+      return purgeTrashItem(id);
+    };
   });
   // 客户id / 客户名称 双向联动（datalist 选项由 loadTrash 预先加载）
   $$('#trashList [data-trash-restore]').forEach(form => bindCustomerInputs(form));
@@ -2271,11 +2276,38 @@ async function loadTrash() {
   }
 }
 
+// 回收站表单取值：整行字段（含 textarea / select；标签字段的值在 hidden input 里）
+function trashFormData(form) {
+  if (!form) return {};
+  return Object.fromEntries(
+    [...form.querySelectorAll('input[name], textarea[name], select[name]')]
+      .map(el => [el.name, String(el.value ?? '').trim()])
+  );
+}
+
+async function saveTrashItem(id, button) {
+  const form = button.closest('[data-trash-restore]');
+  button.disabled = true;
+  try {
+    const d = await api(`/api/trash/${id}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ server_data: trashFormData(form) }),
+    });
+    toast(d.message);
+    // 保存后仍留在回收站：保持这张卡片展开，别让用户重新找
+    if (!state.trashExpanded.includes(id)) state.trashExpanded.push(id);
+    await loadTrash();
+  } catch (e) {
+    toast(e.message, true);
+  } finally {
+    button.disabled = false;
+  }
+}
+
 async function restoreTrashItem(id, button) {
   const form = button.closest('[data-trash-restore]');
-  const serverData = form
-    ? Object.fromEntries([...form.querySelectorAll('input')].map(input => [input.name, input.value.trim()]))
-    : {};
+  const serverData = trashFormData(form);
   try {
     const d = await api(`/api/trash/${id}/restore`, {
       method: 'POST',
