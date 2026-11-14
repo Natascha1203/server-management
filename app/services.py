@@ -813,8 +813,10 @@ def validate_pending_change_update(change, candidate):
     # 申请提交时就带了占用意图：编辑申请内容后仍然允许占着那些机位，否则用户一改备注就被拦下
     allow_takeover = bool(dict(change).get("takeover")) and entity == "servers"
     if change["operation"] == "新增":
+        # 占用模式下同序列号的被替换记录要剔除，否则「主键已存在」会先拦住编辑
+        checked = records_for_takeover_validation(records, candidate, allow_takeover)
         normalized, errors = validate_record(
-            entity, candidate, records, allow_occupied_slots=allow_takeover
+            entity, candidate, checked, allow_occupied_slots=allow_takeover
         )
         key = record_key(meta, normalized)
     else:
@@ -974,9 +976,12 @@ def approve_change(change, final_new_data=None, conn=None, actor=""):
         if not new:
             raise ValueError("新增申请缺少审批后数据")
         takeover = bool(dict(change).get("takeover")) and entity == "servers"
-        key = validate_final_new_data(entity, change, new, records, allow_takeover=takeover)
+        # 同序列号 + 占用 = 原地覆盖那条记录（不进回收站），校验时要先把它从「已有记录」里剔除
+        replacement = takeover_replacement(records, new) if takeover else None
+        checked = records_for_takeover_validation(records, new, takeover)
+        key = validate_final_new_data(entity, change, new, checked, allow_takeover=takeover)
         if takeover:
-            displaced = takeover_victims(records, new)
+            displaced = takeover_victims(checked, new)
             if displaced:
                 victims = {clean_value(item.get("序列号")) for item in displaced}
                 for victim in displaced:
@@ -989,7 +994,14 @@ def approve_change(change, final_new_data=None, conn=None, actor=""):
                     )
                 # 先腾位再落新记录：否则新记录和原占用者会同时出现在同一机位上
                 records = [item for item in records if clean_value(item.get("序列号")) not in victims]
-        records.append(new)
+        if replacement is not None:
+            target_serial = clean_value(replacement.get("序列号"))
+            records = [
+                new if clean_value(item.get("序列号")) == target_serial else item
+                for item in records
+            ]
+        else:
+            records.append(new)
     else:
         key = change["record_key"]
         idx = next((i for i, x in enumerate(records) if record_key(meta, x) == key), None)
@@ -1336,8 +1348,9 @@ def validate_rack_request(data):
     customer_ids = {row["客户id"] for row in read_records("customers")}
     room_names = {row["机房"] for row in read_records("cabinets") if row["机房"]}
     if request_type == "上架":
-        if existing_server:
-            errors.append(f"序列号 {data['序列号']} 已存在；要修改已有服务器请提交「变更」请求")
+        # 序列号已存在不再直接拒绝：上架支持「同序列号原地替换」——机位点选那台服务器
+        # 所在的机位并开启占用，实施时用本次数据覆盖原记录（见 takeover_replacement）。
+        # 机位要到分配阶段才确定，这里只校验客户与机房，重复由分配/实施阶段判定。
         if not data["客户id"]:
             errors.append("客户id不能为空")
         elif data["客户id"] not in customer_ids:
@@ -1587,11 +1600,59 @@ def takeover_victims(records, server_data, exclude_key=""):
     return victims
 
 
+def takeover_replacement(records, server_data, exclude_key=""):
+    """同序列号的「原地替换」对象 —— 占用模式下要覆盖而不是新增的那条记录。
+
+    上架/新增时如果填的序列号正好等于目标机位上那台服务器，就不该「新机顶掉旧机
+    再写一条」：同一台机器不会同时存在两条记录。这种情况按**原地覆盖**处理——
+    用本次填写的数据换掉服务器表里那一行，不写回收站（机器并没有下架）。
+    """
+    serial = clean_value(server_data.get("序列号"))
+    if not serial:
+        return None
+    for victim in takeover_victims(records, server_data, exclude_key=exclude_key):
+        if clean_value(victim.get("序列号")) == serial:
+            return victim
+    return None
+
+
+def records_for_takeover_validation(records, server_data, allow_takeover, exclude_key=""):
+    """校验用的「已有记录」：占用模式下先剔除将被原地覆盖的同序列号记录。
+
+    否则 validate_record 的「主键已存在」会先报错，根本走不到腾位那一步。
+    只用于校验与算受害者，落库仍然操作原始 records。
+    """
+    if not allow_takeover:
+        return records
+    replacement = takeover_replacement(records, server_data, exclude_key=exclude_key)
+    if not replacement:
+        return records
+    target = clean_value(replacement.get("序列号"))
+    return [item for item in records if clean_value(item.get("序列号")) != target]
+
+
 def validate_rack_allocation(server_data, request_id="", allow_takeover=False):
     required = ["所在机房", "所属机柜", "所属机位", "管理ip", "带外ip"]
     errors = [f"{field}不能为空" for field in required if not clean_value(server_data.get(field))]
+    records = read_records("servers")
+    replacement = takeover_replacement(records, server_data) if allow_takeover else None
+    serial = clean_value(server_data.get("序列号"))
+    # 同序列号原地覆盖时，那条记录要先从「已有记录」里剔除，否则主键重复会先报错
+    checked = records_for_takeover_validation(records, server_data, allow_takeover)
+    if serial and replacement is None:
+        duplicate = next((item for item in records if clean_value(item.get("序列号")) == serial), None)
+        if duplicate:
+            location = " / ".join(
+                clean_value(duplicate.get(field)) for field in ("所在机房", "所属机柜", "所属机位")
+            )
+            errors.append(
+                f"序列号 {serial} 已在 {location} 使用：要替换它请点选该机位并开启占用模式，"
+                "否则请改用「变更」请求"
+            )
+            # 已经给出准确提示，不再重复报「主键已存在」
+            checked = [item for item in checked if clean_value(item.get("序列号")) != serial]
     _, record_errors = validate_record(
-        "servers", server_data, read_records("servers"), allow_occupied_slots=allow_takeover
+        "servers", server_data, checked, allow_occupied_slots=allow_takeover
     )
     return errors + record_errors + implementation_slot_conflict_errors(server_data, request_id) + same_kind_ip_conflict_errors(
         normalize_row("servers", server_data),
@@ -1617,6 +1678,8 @@ def complete_rack_request(conn, row, user, server_data=None, takeover=False):
 
     takeover=True 表示允许占走已被占用的机位：目标机位上原有的服务器会整台
     移进回收站（reason=机位被占用），腾出位置后再写入本次记录。
+    例外：占用对象与本次序列号相同时按「原地覆盖」处理——同一台机器换配置/换位置，
+    用新数据替换那一行，不写回收站。
     """
     records = read_records("servers")
     request_type = row["request_type"]
@@ -1625,16 +1688,19 @@ def complete_rack_request(conn, row, user, server_data=None, takeover=False):
     operation = {"上架": "新增", "变更": "更新"}.get(request_type, "删除")
     final_serial = key
     displaced = []
+    replaced = False
     if request_type == "上架":
+        replacement = takeover_replacement(records, server_data or {}) if takeover else None
+        checked = records_for_takeover_validation(records, server_data or {}, takeover)
         normalized, errors = validate_record(
-            "servers", server_data or {}, records, allow_occupied_slots=takeover
+            "servers", server_data or {}, checked, allow_occupied_slots=takeover
         )
         if errors:
             return None, errors
         event_server_data = normalized
         final_serial = record_key(ENTITIES["servers"], normalized)
         if takeover:
-            displaced = takeover_victims(records, normalized)
+            displaced = takeover_victims(checked, normalized)
             if displaced:
                 victims = {clean_value(item.get("序列号")) for item in displaced}
                 for victim in displaced:
@@ -1643,7 +1709,16 @@ def complete_rack_request(conn, row, user, server_data=None, takeover=False):
                         reason=TRASH_REASON_TAKEOVER,
                     )
                 records = [item for item in records if clean_value(item.get("序列号")) not in victims]
-        records.append(normalized)
+        if replacement is not None:
+            # 同序列号：覆盖原记录，不新增、不写回收站
+            target_serial = clean_value(replacement.get("序列号"))
+            records = [
+                normalized if clean_value(item.get("序列号")) == target_serial else item
+                for item in records
+            ]
+            replaced = True
+        else:
+            records.append(normalized)
         write_records("servers", records)
     elif request_type == "变更":
         current = next((item for item in records if item["序列号"] == key), None)
@@ -1689,14 +1764,16 @@ def complete_rack_request(conn, row, user, server_data=None, takeover=False):
     ))
     event_row = dict(row)
     event_row["reviewed_at"] = reviewed_at
+    notes = []
     if displaced:
         titles = "、".join(clean_value(item.get("序列号")) for item in displaced)
-        message = (
-            f"服务器{request_type}具体实施已完成，已生成版本 {version_code}；"
-            f"占用的机位原有服务器 {titles} 已下架并移入回收站"
-        )
-    else:
-        message = f"服务器{request_type}具体实施已完成，已生成版本 {version_code}"
+        notes.append(f"占用的机位原有服务器 {titles} 已下架并移入回收站")
+    if replaced:
+        # 同序列号原地覆盖：机器没下架，只是记录被新数据替换，不进回收站
+        notes.append(f"同序列号 {final_serial} 已原地覆盖原记录")
+    message = f"服务器{request_type}具体实施已完成，已生成版本 {version_code}"
+    if notes:
+        message += "；" + "；".join(notes)
     notify_rack_stage(conn, event_row, "approved", "服务器上下架具体实施已完成", user["用户id"], event_server_data)
     return message, []
 

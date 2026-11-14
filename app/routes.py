@@ -570,13 +570,28 @@ def add_entity(entity):
     # takeover：新增时也允许占走已被占用的机位（原占用者整台下架进回收站）。
     # 意图必须显式传，默认仍按机位冲突拦截——这是会让别人机器下线的操作。
     takeover = bool(body.pop("takeover", False)) and entity == "servers"
-    row, errors = services.validate_record(entity, body, current, allow_occupied_slots=takeover)
+    if entity == "servers" and not takeover:
+        # 序列号已在表里又没开占用：这条主键重复是最常见的误操作，单独给可执行的提示
+        serial = clean_value(body.get("序列号"))
+        duplicate = next((item for item in current if clean_value(item.get("序列号")) == serial), None) if serial else None
+        if duplicate:
+            location = " / ".join(
+                clean_value(duplicate.get(field)) for field in ("所在机房", "所属机柜", "所属机位")
+            )
+            return jsonify(error=(
+                f"序列号 {serial} 已存在于 {location}：要用同一序列号替换它，"
+                "请开启占用模式并点选该机位；只想改信息请用「修改」"
+            )), 400
+    # 同序列号 + 占用 = 原地覆盖那条记录：校验时先把它从「已有记录」里剔除，否则主键重复先报错
+    checked = services.records_for_takeover_validation(current, body, takeover)
+    row, errors = services.validate_record(entity, body, checked, allow_occupied_slots=takeover)
     if errors:
         return jsonify(error="；".join(errors)), 400
     from .core import record_key
 
     user = current_user()
-    displaced = services.takeover_victims(current, row) if takeover else []
+    replacement = services.takeover_replacement(current, row) if takeover else None
+    displaced = services.takeover_victims(checked, row) if takeover else []
     change_id = apply_change(entity, "新增", record_key(ENTITIES[entity], row), row, user, takeover=takeover)
     message = "已保存并直接生效" if is_admin_user(user) else "已提交新增申请"
     if displaced:
@@ -584,6 +599,12 @@ def add_entity(entity):
         message += (
             f"；机位原有服务器 {titles} 已下架到回收站" if is_admin_user(user)
             else f"；审批通过后机位原有服务器 {titles} 将被下架到回收站"
+        )
+    if replacement is not None:
+        serial = clean_value(replacement.get("序列号"))
+        message += (
+            f"；同序列号 {serial} 已原地覆盖原记录（不进回收站）" if is_admin_user(user)
+            else f"；审批通过后将原地覆盖同序列号 {serial} 的记录（不进回收站）"
         )
     return jsonify(message=message, change_id=change_id)
 

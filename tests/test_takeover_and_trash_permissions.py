@@ -282,6 +282,107 @@ class TestAddTakeover:
         assert "takeover" not in record
 
 
+class TestSameSerialReplacement:
+    """要上架的序列号 == 被占用机位上那台服务器：原地覆盖那一行，不进回收站。"""
+
+    def submit_up(self, client, serial="SRV-OLD"):
+        return client.post("/api/rack-requests", json={
+            "请求类型": "上架", "序列号": serial, "客户id": "1",
+            "所在机房": "机房A", "是否重装系统": "是",
+        })
+
+    def review(self, client, request_id, data, takeover=False):
+        body = {"action": "approve", "server_data": data}
+        if takeover:
+            body["takeover"] = True
+        return client.post(f"/api/rack-requests/{request_id}/review", json=body)
+
+    def test_submit_accepts_existing_serial(self, app_env, admin):
+        """提交阶段不再因为序列号已存在而拒绝——机位到分配阶段才定，重复留给分配判定。"""
+        client = setup_base(app_env)
+        login(client)
+        resp = self.submit_up(client)
+        assert resp.status_code == 200, resp.get_json()
+        assert resp.get_json()["request_id"]
+
+    def test_allocation_blocks_without_takeover(self, app_env, admin):
+        client = setup_base(app_env)
+        login(client)
+        request_id = self.submit_up(client).get_json()["request_id"]
+
+        resp = self.review(client, request_id, new_server_data(slot="3-4"))
+        assert resp.status_code == 400
+        error = resp.get_json()["error"]
+        # 提示要能直接指导操作：位置在哪、怎么替换、否则用什么入口
+        assert "已在 机房A / C1 / 3-4 使用" in error
+        assert "占用模式" in error
+        assert "变更" in error
+
+    def test_allocation_accepts_takeover(self, app_env, admin):
+        client = setup_base(app_env)
+        login(client)
+        request_id = self.submit_up(client).get_json()["request_id"]
+
+        resp = self.review(client, request_id, new_server_data(slot="3-4"), takeover=True)
+        assert resp.status_code == 200, resp.get_json()
+        with storage.db() as conn:
+            row = conn.execute("SELECT stage,takeover FROM rack_requests WHERE id=?", (request_id,)).fetchone()
+        assert row["stage"] == "implementation"
+        assert row["takeover"] == 1
+
+    def test_implementation_overwrites_record_in_place(self, app_env, admin):
+        client = setup_base(app_env)
+        login(client)
+        request_id = self.submit_up(client).get_json()["request_id"]
+        data = {**new_server_data(slot="3-4"), "品牌": "H3C", "备注": "换机后"}
+        assert self.review(client, request_id, data, takeover=True).status_code == 200
+
+        resp = self.review(client, request_id, data, takeover=True)
+        assert resp.status_code == 200, resp.get_json()
+        message = resp.get_json()["message"]
+        assert "原地覆盖" in message
+        assert "已下架并移入回收站" not in message
+
+        records = storage.read_records("servers")
+        assert len(records) == 1
+        assert records[0]["序列号"] == "SRV-OLD"
+        # 新数据覆盖旧数据
+        assert records[0]["品牌"] == "H3C"
+        assert records[0]["备注"] == "换机后"
+        assert records[0]["管理ip"] == "10.1.1.9/24"
+        # 同一台机器没下架，回收站里不该有它
+        assert trash_serials() == set()
+
+    def test_direct_add_same_serial_without_takeover_is_explained(self, app_env, admin):
+        """没开占用模式时，同序列号要给「怎么替换 / 该用哪个入口」的提示，而不是干巴巴的主键重复。"""
+        client = setup_base(app_env)
+        login(client)
+        body = {**new_server_data(slot="3-4"), "序列号": "SRV-OLD"}
+
+        resp = client.post("/api/servers/add", json=body)
+        assert resp.status_code == 400
+        error = resp.get_json()["error"]
+        assert "已存在于 机房A / C1 / 3-4" in error
+        assert "占用模式" in error
+        assert "修改" in error
+
+    def test_direct_add_same_serial_overwrites(self, app_env, admin):
+        client = setup_base(app_env)
+        login(client)
+        body = {**new_server_data(slot="3-4"), "序列号": "SRV-OLD", "品牌": "H3C", "takeover": True}
+
+        resp = client.post("/api/servers/add", json=body)
+        assert resp.status_code == 200, resp.get_json()
+        message = resp.get_json()["message"]
+        assert "原地覆盖" in message
+        assert "已下架并移入回收站" not in message
+
+        records = storage.read_records("servers")
+        assert [row["序列号"] for row in records] == ["SRV-OLD"]
+        assert records[0]["品牌"] == "H3C"
+        assert trash_serials() == set()
+
+
 class TestTrashSnapshotCompleteness:
     def test_snapshot_holds_all_server_headers(self, app_env, admin):
         client = setup_base(app_env)

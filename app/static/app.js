@@ -1123,8 +1123,13 @@ function renderServerForm(row) {
       el.innerHTML = '';
       return;
     }
+    // 占用的正好是同一个序列号：这台机器没下架，只是记录被本次数据覆盖
+    const serial = ($('#formFields [name="序列号"]')?.value || '').trim();
+    const sameSerial = serial && owners.includes(serial);
     el.hidden = false;
-    el.innerHTML = `<span>⚠ 保存后将把 <b>${owners.map(esc).join('、')}</b> 整台下架并移入回收站</span>`;
+    el.innerHTML = sameSerial
+      ? `<span>⚠ 机位上是同一台服务器 <b>${esc(serial)}</b>：保存后会用本次填写的信息<b>覆盖这条记录</b>，不写回收站</span>`
+      : `<span>⚠ 保存后将把 <b>${owners.map(esc).join('、')}</b> 整台下架并移入回收站</span>`;
   }
   function renderSlotPicker() {
     const room = rooms.find(x => x.name === roomSelect.value);
@@ -1247,6 +1252,9 @@ function renderServerForm(row) {
   };
   renderCabinetSelect(initialCabinet);
   bindCustomerInputs($('#formFields'));
+  // 序列号在占用模式下决定「下架原机」还是「覆盖同序列号记录」，改动后要重算提示
+  const serialInput = $('#formFields [name="序列号"]');
+  if (serialInput) serialInput.addEventListener('input', renderTakeoverNotice);
 }
 
 async function openModal(mode, row = {}) {
@@ -1597,9 +1605,10 @@ function rackSelectedTakeoverOwners(id) {
   return [...owners];
 }
 
-/** 选中了已占用机位时给出明确警告：这些人会被下架进回收站。 */
+/** 选中了已占用机位时给出明确警告：这些人会被下架进回收站（同序列号则是原地覆盖）。 */
 function renderRackTakeoverNotice(id) {
-  const box = rackApprovalFormById(id)?.querySelector('[data-rack-takeover-notice]');
+  const form = rackApprovalFormById(id);
+  const box = form?.querySelector('[data-rack-takeover-notice]');
   if (!box) return;
   const owners = rackSelectedTakeoverOwners(id);
   if (!owners.length) {
@@ -1607,8 +1616,17 @@ function renderRackTakeoverNotice(id) {
     box.innerHTML = '';
     return;
   }
+  const item = state.rackRequests.find(row => row.id === id) || {};
+  // 请求 JSON 里的序列号在「序列号」字段（stage_data 里是分配后确认的值）
+  const serial = String(
+    item['序列号'] || (item.stage_data && item.stage_data['序列号'])
+    || form.querySelector('[name="序列号"]')?.value || ''
+  ).trim();
+  const sameSerial = serial && owners.includes(serial);
   box.hidden = false;
-  box.innerHTML = `<span>⚠ 将占用已有服务器所在机位 <b>${owners.map(esc).join('、')}</b>：提交后该服务器整台下架并移入回收站</span>`;
+  box.innerHTML = sameSerial
+    ? `<span>⚠ 该机位上是同一台服务器 <b>${esc(serial)}</b>：实施时用本次填写的信息<b>原地覆盖</b>这条记录，不写回收站</span>`
+    : `<span>⚠ 将占用已有服务器所在机位 <b>${owners.map(esc).join('、')}</b>：提交后该服务器整台下架并移入回收站</span>`;
 }
 
 function chooseRackSlot(id, slot) {

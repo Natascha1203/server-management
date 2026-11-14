@@ -77,11 +77,13 @@ const dom = new JSDOM(`<!DOCTYPE html><html><body>
     <input name="所属机柜" data-rack-cabinet value="C1">
     <input name="所属机位" data-rack-slot-input value="3-4">
     <div data-rack-slot-picker></div>
+    <div class="takeover-notice" data-rack-takeover-notice hidden></div>
   </form>
   <select id="serverRoomSelect"><option value="机房A" selected>机房A</option></select>
   <select id="serverCabinetSelect"><option value="C1" selected>C1</option></select>
   <input id="serverSlotInput">
   <input type="checkbox" id="takeoverToggle">
+  <div id="formFields"><input name="序列号" value=""></div>
   <div id="takeoverNotice" class="takeover-notice" hidden></div>
   <div id="swapNotice" class="swap-notice" hidden></div>
   <div id="serverSlotPicker"></div>
@@ -115,7 +117,7 @@ const factory = new Function(`
   const roomSelect = document.querySelector('#serverRoomSelect');
   const cabinetSelect = document.querySelector('#serverCabinetSelect');
   ${code}
-  return { state, renderRackSlotPicker, chooseRackSlot, renderSlotPicker, requestSlotSwap, renderSwapNotice, chooseSlot };
+  return { state, renderRackSlotPicker, chooseRackSlot, renderSlotPicker, requestSlotSwap, renderSwapNotice, chooseSlot, renderTakeoverNotice, renderRackTakeoverNotice };
 `);
 const api = factory();
 const $$t = s => [...document.querySelectorAll(s)];
@@ -238,7 +240,30 @@ const sleep = ms => new Promise(r => setTimeout(r, ms));
   check('T8 点击后输入框=1-1', document.querySelector('#serverSlotInput').value === '1-1');
   check('T8 提示条写明将被下架', document.getElementById('takeoverNotice').textContent.includes('S1'));
   check('T8 state.takeoverOwners 记录被下架序列号', JSON.stringify(api.state.takeoverOwners) === '["S1"]');
+
+  // ===== T8b: 序列号与占用者相同 —— 文案要改成「原地覆盖」，不能再说整台下架 =====
+  const serialInput = document.querySelector('#formFields [name="序列号"]');
+  serialInput.value = 'S1';
+  api.renderTakeoverNotice();
+  const noticeText = document.getElementById('takeoverNotice').textContent;
+  check('T8b 同序列号提示原地覆盖该记录', noticeText.includes('覆盖这条记录'));
+  check('T8b 同序列号不再提示整台下架', !noticeText.includes('整台下架'));
+  serialInput.value = 'SRV-NEW';
+  api.renderTakeoverNotice();
+  check('T8c 不同序列号仍提示整台下架', document.getElementById('takeoverNotice').textContent.includes('整台下架'));
   toggle.checked = false;
+
+  // ===== T8d: 上架请求（分配/实施）同序列号 —— 提示也要改成原地覆盖 =====
+  api.state.rackRequests[0]['序列号'] = 'SRV-OLD';
+  api.state.rackRequests[0].stage_data = { '所在机房': '机房A', '所属机柜': 'C1', '所属机位': '9-9' };
+  api.state.rackApprovalOptions.rooms[0].cabinets[0].slots.push(
+    { slot: '9', status: 'occupied', server: 'SRV-OLD', selectable: false, owner_range: '9-9' }
+  );
+  document.querySelector('[data-rack-slot-input]').value = '9-9';
+  api.renderRackTakeoverNotice('reqA');
+  const rackNotice = document.querySelector('[data-rack-takeover-notice]').textContent;
+  check('T8d 请求同序列号：提示原地覆盖', rackNotice.includes('原地覆盖'));
+  check('T8d 请求同序列号：不再提示整台下架', !rackNotice.includes('整台下架'));
 
   // ===== T9: style.css 锁定样式覆盖 .disabled 类 =====
   check('T9 css 含 .slot-choice.disabled 锁定样式', css.includes('.slot-choice:disabled,.slot-choice.disabled{'));
