@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import json
+import os
 import time
 
 from .client import SMError
@@ -157,7 +158,9 @@ TOOL_SPECS = [
             "这是会让别人机器下线的操作。原占用者按**整台**下架（哪怕只相交 1U），"
             "且提交成功不代表已生效：非管理人员仍要走 sm_review。"
             "例外：如果要新增的 `序列号` 正是目标机位上那台服务器，传 takeover=true 会**原地覆盖**"
-            "那条记录（不新增、不进回收站），用于同一台机器换配置/换位置。"
+            "那条记录（不新增、不进回收站），用于同一台机器换配置/换位置。\n"
+            "服务端会在真正写入前自动备份一份当前数据，返回里的 auto_backup 就是它；"
+            "回复使用者时可以把这份备份告诉他，需要撤回时到页面「设置 → 数据恢复」选它。"
         ),
         "inputSchema": {
             "type": "object",
@@ -198,6 +201,8 @@ TOOL_SPECS = [
             "管理员 token 下删除直接生效；其他身份只提交待审批申请。"
             "只是想让新服务器占这个机位，不要用删除——用 sm_upsert(..., takeover=true) "
             "或 sm_rack_review(..., takeover=true)，那才会正确留痕并进回收站。"
+            "删除前服务端会自动备份当前数据（返回里的 auto_backup），但 cabinets / customers "
+            "的删除仍然无法通过回收站撤销，只能靠那份备份整体恢复。"
         ),
         "inputSchema": {
             "type": "object",
@@ -389,6 +394,33 @@ def _table(rows, headers, limit=None):
 
 # ---------------------------------------------------------------- 工具实现
 
+def _version_lines(client):
+    """客户端代码版本 vs 后端包版本。
+
+    客户端版本由引导器（run_server.py）在启动时写进 SM_MCP_RUNNING_VERSION；
+    直接 ``python -m sm_mcp`` 跑源码时没有这个变量，显示「未知」。
+    两者不一致时明确告诉 agent「重启即可自动更新」——agent 会把它转述给使用者，
+    比让使用者等到某个工具报错才发现是旧版要好。
+    """
+    local = (os.environ.get("SM_MCP_RUNNING_VERSION") or "").strip()
+    remote = ""
+    try:
+        remote = str((client.json("/api/mcp/version") or {}).get("version") or "")
+    except SMError:
+        pass
+    local_text = local or "未知（直接以源码目录运行）"
+    if not remote:
+        return "- 客户端代码 %s · 后端版本读取失败" % local_text
+    if not local:
+        return "- 客户端代码 %s · 后端 %s" % (local_text, remote)
+    if local == remote:
+        return "- 客户端代码 %s · 后端 %s（一致）" % (local, remote)
+    return (
+        "- 客户端代码 %s · 后端 %s —— **客户端偏旧**：让使用者重启客户端（新开会话）即会自动更新，"
+        "当前会话仍在跑旧代码，缺少新版工具时不要反复重试。" % (local, remote)
+    )
+
+
 def _bootstrap(client, args):
     manifest = client.json("/api/skill/manifest")
     skill_md = client.text("/api/skill/docs", {"name": "skill"})
@@ -425,6 +457,10 @@ def _bootstrap(client, args):
             lines.append("## 校验规则（校验失败时先看这里）")
             for rule in rules:
                 lines.append("- " + rule)
+
+    lines.append("")
+    lines.append("## 版本")
+    lines.append(_version_lines(client))
 
     lines.append("")
     lines.append("## 身份")
@@ -670,7 +706,19 @@ def _same_key(left, right):
     return _norm(left) == _norm(right)
 
 
-def _write_result(operation, entity, record_key, result):
+def _auto_backup_note(client):
+    """写操作的返回里带上「这次改之前备份到哪一份」，方便撤回。"""
+    name = getattr(client, "last_auto_backup", "") or ""
+    if not name:
+        return {}
+    return {
+        "auto_backup": name,
+        "restore_hint": "服务端已在写入前自动备份当前数据（%s）。要撤回这次改动，"
+                        "到页面「设置 → 数据恢复」选这一份恢复即可。" % name,
+    }
+
+
+def _write_result(operation, entity, record_key, result, client=None):
     """把后端的中文 message 翻译成结构化字段。
 
     后端没有返回布尔标记，只能靠文案判断是否直接生效（routes.py 里 admin 分支固定带
@@ -696,6 +744,7 @@ def _write_result(operation, entity, record_key, result):
             else '尚未生效：这是待审批申请，需管理人员调 sm_review(ids=["%s"], action="approve") 后才落库。'
             % (change_id or "<change_id>")
         ),
+        **_auto_backup_note(client),
     })
 
 
@@ -735,7 +784,7 @@ def _upsert(client, args):
             if takeover:
                 payload["takeover"] = True
             result = client.json("/api/%s/add" % entity, method="POST", payload=payload)
-            return _write_result("新增", entity, _key_text(key_fields, row), result)
+            return _write_result("新增", entity, _key_text(key_fields, row), result, client)
 
         old = _key_parts(key_fields, old_key, entity)
         blank = [f for f in key_fields if not old.get(f)]
@@ -757,7 +806,7 @@ def _upsert(client, args):
         if takeover:
             payload["takeover"] = True
         result = client.json("/api/%s/update" % entity, method="POST", payload=payload)
-        return _write_result("修改", entity, _key_text(key_fields, new), result)
+        return _write_result("修改", entity, _key_text(key_fields, new), result, client)
 
     return _idempotent("sm_upsert", args, run)
 
@@ -801,10 +850,10 @@ def _delete(client, args):
 
     if len(parts) == 1:
         result = client.json("/api/%s/delete" % entity, method="POST", payload=parts[0])
-        return _write_result("删除", entity, _key_text(key_fields, parts[0]), result)
+        return _write_result("删除", entity, _key_text(key_fields, parts[0]), result, client)
 
     result = client.json("/api/%s/delete-batch" % entity, method="POST", payload={"records": parts})
-    return _write_result("批量删除", entity, "%d 条" % len(parts), result)
+    return _write_result("批量删除", entity, "%d 条" % len(parts), result, client)
 
 
 def _pending(client, args):
@@ -881,6 +930,7 @@ def _review(client, args):
             "action": action,
             "reviewed": [{"id": ids[0], "message": result.get("message", "")}],
             "message": result.get("message", ""),
+            **_auto_backup_note(client),
         })
 
     payload = {"action": action, "ids": ids, "reason": reason}
@@ -892,6 +942,7 @@ def _review(client, args):
         "reviewed": result.get("results") or [],
         "count": result.get("reviewed", 0),
         "message": result.get("message", ""),
+        **_auto_backup_note(client),
     })
 
 
@@ -915,6 +966,7 @@ def _rack_submit(client, args):
             "request_id": result.get("request_id", ""),
             "message": result.get("message", ""),
             "next": RACK_SUBMIT_NEXT.get(request_type, RACK_SUBMIT_NEXT["上架"]),
+            **_auto_backup_note(client),
         })
 
     return _idempotent("sm_rack_submit", args, run)
@@ -968,6 +1020,7 @@ def _rack_review(client, args):
         "action": action,
         "takeover": bool(args.get("takeover")) and action == "approve",
         "message": result.get("message", ""),
+        **_auto_backup_note(client),
     })
 
 

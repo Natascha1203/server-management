@@ -2,7 +2,7 @@ const APP_CAPABILITIES = window.APP_CAPABILITIES || [];
 const APP_USER = window.APP_USER || {};
 const SERVER_APPROVAL_HEADERS = ['序列号', '品牌', '型号', 'CPU型号', '网卡', '服务器成本(万)', '归属单位', '用途分类', '用途', '防火墙白名单', '资源申请编号', '是否液冷', '客户id', '客户名称', '所在机房', '所属机柜', '所属机位', '管理ip', '交易ip', '带外ip', '管理密码', '带外密码', '上架时间', '接入行情', '接入柜台', '备注'];
 const RACK_REVIEW_FILTER_FIELDS = ['序列号', '客户id', '客户名称', '所在机房'];
-const state = { entity: 'cabinets', records: [], meta: null, editing: null, pendingEditing: null, rackEditing: null, rackRequestStatus: 'pending', status: 'pending', reviewMode: 'allocation', stats: null, filters: [], sorts: [], reviewFilters: [], rackRequestFilters: [], changes: [], rackRequests: [], rackApprovalOptions: { rooms: [] }, rackSlotPick: {}, rackRequestExpanded: [], rackReviewExpanded: [], systemUsers: [], customerOptions: [], fieldOptions: {}, fieldOptionsAdmin: null, attachmentMap: {}, attachmentCounts: {}, attachmentModalSerial: '', trash: [], trashExpanded: [] };
+const state = { entity: 'cabinets', records: [], meta: null, editing: null, pendingEditing: null, rackEditing: null, rackRequestStatus: 'pending', status: 'pending', reviewMode: 'allocation', stats: null, filters: [], sorts: [], reviewFilters: [], rackRequestFilters: [], changes: [], rackRequests: [], rackApprovalOptions: { rooms: [] }, rackSlotPick: {}, rackRequestExpanded: [], rackReviewExpanded: [], systemUsers: [], customerOptions: [], fieldOptions: {}, fieldOptionsAdmin: null, attachmentMap: {}, attachmentCounts: {}, attachmentModalSerial: '', trash: [], trashExpanded: [], snapshots: [] };
 const $ = s => document.querySelector(s);
 const $$ = s => [...document.querySelectorAll(s)];
 
@@ -2530,12 +2530,15 @@ async function loadSettings() {
     $('#backupKeepCount').value = s.backup_keep_count;
     $('#backupCommand').value = s.backup_command || '';
     $('#auditKeepCount').value = s.audit_keep_count;
+    if ($('#autoBackupKeep')) $('#autoBackupKeep').value = s.auto_backup_keep ?? '';
     $('#notifyEnabled').checked = Number(s.notify_enabled || 0) === 1;
     $('#notifyWebhookUrl').value = s.notify_webhook_url || '';
     $('#notifyMessageType').value = s.notify_message_type || 'markdown';
+    if ($('#snapshotDir')) $('#snapshotDir').value = s.snapshot_dir || '';
   } catch (e) {
     toast(e.message, true);
   }
+  loadSnapshots();
 }
 
 async function saveSettings(event) {
@@ -2554,8 +2557,171 @@ async function runBackup() {
   try {
     const d = await api('/api/backups/run', { method: 'POST' });
     toast(d.message);
+    loadSnapshots();
   } catch (e) {
     toast(e.message, true);
+  }
+}
+
+/* ==== 数据恢复 ====
+   快照目录（设置里的 snapshot_dir）下既有 cron 每天打的 zip，也有系统手动备份的 manual/B* 目录。
+   恢复 = 用快照里的三张正式表覆盖 data/official；app.db 可选；恢复前系统会自己再备份一份，
+   所以「恢复」本身可以再被恢复回来。 */
+const ENTITIES_LABELS = { customers: '客户表', cabinets: '机柜表', servers: '服务器表' };
+
+function snapshotOriginLabel(item) {
+  if (item.kind === 'zip') return '定时备份包';
+  if (item.origin === 'auto') return '写前自动备份';
+  return item.origin === 'manual' ? '手动备份' : '旧版备份';
+}
+
+function snapshotSizeText(bytes) {
+  return attachmentSizeText(bytes);
+}
+
+function snapshotCard(item) {
+  const counts = Object.entries(item.record_counts || {})
+    .map(([entity, count]) => `${(ENTITIES_LABELS[entity] || entity)} ${count}`)
+    .join(' · ');
+  const problems = (item.errors || []).join('；');
+  const badges = [
+    item.has_db ? '<span class="tag good">含 app.db</span>' : '<span class="tag">仅 Excel</span>',
+    item.has_users ? '<span class="tag">含 users.json（不恢复）</span>' : '',
+  ].join('');
+  const restoreBtn = item.valid
+    ? `<button class="btn primary" type="button" data-snapshot-restore="${esc(item.name)}">恢复到该快照</button>`
+    : '<span class="muted">不可恢复</span>';
+  // 删除对 zip 与目录都开放：两者都是磁盘上的一份备份，留着不放只会占空间
+  const deleteBtn = `<button class="btn danger" type="button" data-snapshot-delete="${esc(item.name)}" data-snapshot-kind="${esc(item.kind)}">删除</button>`;
+  return `<article class="snapshot-card${item.valid ? '' : ' invalid'}">
+    <div class="snapshot-main">
+      <div class="snapshot-title"><strong>${esc(item.name)}</strong><span class="tag">${esc(snapshotOriginLabel(item))}</span>${badges}</div>
+      <div class="snapshot-meta"><span>${esc(item.mtime)}</span><span>${esc(snapshotSizeText(item.size))}</span>${counts ? `<span>${esc(counts)}</span>` : ''}</div>
+      ${problems ? `<p class="muted snapshot-error">${esc(problems)}</p>` : ''}
+    </div>
+    <div class="snapshot-actions">${restoreBtn}${deleteBtn}</div>
+  </article>`;
+}
+
+function renderSnapshots(payload) {
+  const box = $('#snapshotList');
+  if (!box) return;
+  if (payload && payload.scan_error) {
+    box.innerHTML = `<p class="muted snapshot-error">${esc(payload.scan_error)}</p>`;
+    return;
+  }
+  const items = (payload && payload.items) || [];
+  if (!items.length) {
+    box.innerHTML = `<p class="muted">快照目录里还没有可恢复的备份（${esc((payload && payload.root) || '')}）</p>`;
+    return;
+  }
+  box.innerHTML = items.map(snapshotCard).join('');
+  $$('#snapshotList [data-snapshot-restore]').forEach(button => {
+    button.onclick = () => restoreSnapshot(button.dataset.snapshotRestore, button);
+  });
+  $$('#snapshotList [data-snapshot-delete]').forEach(button => {
+    button.onclick = () => deleteSnapshot(button.dataset.snapshotDelete, button);
+  });
+}
+
+async function deleteSnapshot(name, button) {
+  const isDir = button.dataset.snapshotKind === 'dir';
+  const what = isDir ? '这份备份目录（内含三张表与 app.db）' : '这个备份压缩包';
+  if (!confirm(`确认删除 ${what}？\n${name}\n\n删除后不可恢复，也无法再从这个快照回滚。`)) return;
+  button.disabled = true;
+  try {
+    const d = await api('/api/snapshots', {
+      method: 'DELETE',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ snapshot: name }),
+    });
+    toast(d.message);
+    await loadSnapshots();
+  } catch (e) {
+    toast(e.message, true);
+  } finally {
+    button.disabled = false;
+  }
+}
+
+async function loadSnapshots() {
+  if (!$('#snapshotList')) return;
+  try {
+    const d = await api('/api/snapshots');
+    state.snapshots = d.items || [];
+    const hint = $('#snapshotHint');
+    if (hint) {
+      const parts = [`快照目录：${d.root || '未配置'}`];
+      if (d.manual_dir) parts.push(`手动备份写入 ${d.manual_dir}`);
+      if (d.auto_dir) parts.push(`写前自动备份写入 ${d.auto_dir}`);
+      if (d.last_backup_at) parts.push(`上次备份 ${d.last_backup_at}`);
+      if (d.last_restore_at) parts.push(`上次恢复 ${d.last_restore_at}`);
+      hint.textContent = parts.join('；');
+    }
+    renderSnapshots(d);
+  } catch (e) {
+    const box = $('#snapshotList');
+    if (box) box.innerHTML = `<p class="muted snapshot-error">${esc(e.message)}</p>`;
+  }
+}
+
+async function restoreSnapshot(name, button) {
+  let detail;
+  try {
+    detail = (await api('/api/snapshots/preview', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ snapshot: name }),
+    })).snapshot;
+  } catch (e) {
+    toast(e.message, true);
+    return;
+  }
+  if (!detail.restorable) {
+    const missing = Object.entries(detail.missing_columns || {})
+      .map(([entity, cols]) => `${ENTITIES_LABELS[entity] || entity} 缺 ${cols.join('、')}`).join('；');
+    toast(`该快照与当前版本不兼容：${missing}`, true);
+    return;
+  }
+  const lines = [
+    `即将用快照 ${name} 覆盖正式表：`,
+    ...detail.tables.map(t => `· ${t.label} ${t.records} 条`),
+    '',
+    $('#snapshotIncludeDb')?.checked
+      ? (detail.has_db ? '· 同时恢复 app.db（审核记录、回收站、资料索引）' : '· 该快照没有 app.db，只恢复三张表')
+      : '· 不恢复 app.db',
+    $('#snapshotDropPending')?.checked ? '· 恢复后作废所有待审批申请' : '· 保留待审批申请',
+    '',
+    '恢复前会自动把当前状态备份一份，可用它撤回。',
+    '确认请输入 RESTORE：',
+  ];
+  const typed = prompt(lines.join('\n'), '');
+  if (typed === null) return;
+  if (typed.trim().toUpperCase() !== 'RESTORE') {
+    toast('未输入 RESTORE，已取消', true);
+    return;
+  }
+  button.disabled = true;
+  try {
+    const d = await api('/api/snapshots/restore', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        snapshot: name,
+        include_db: !!$('#snapshotIncludeDb')?.checked,
+        drop_pending: !!$('#snapshotDropPending')?.checked,
+        confirm: 'RESTORE',
+      }),
+    });
+    toast(d.message);
+    await loadSnapshots();
+    // 正式表已被整体替换，当前页缓存的数据都作废，按当前实体重新拉一遍
+    state.records = [];
+    await loadEntity();
+  } catch (e) {
+    toast(e.message, true);
+  } finally {
+    button.disabled = false;
   }
 }
 
@@ -3214,6 +3380,7 @@ if ($('#clearRackRequestFilterBtn')) $('#clearRackRequestFilterBtn').onclick = (
 };
 if ($('#settingsForm')) $('#settingsForm').onsubmit = saveSettings;
 if ($('#manualBackupBtn')) $('#manualBackupBtn').onclick = runBackup;
+if ($('#refreshSnapshotsBtn')) $('#refreshSnapshotsBtn').onclick = loadSnapshots;
 if ($('#resetFlowStateBtn')) $('#resetFlowStateBtn').onclick = resetFlowState;
 if ($('#addSystemUserBtn')) $('#addSystemUserBtn').onclick = () => {
   state.systemUsers.push({ '用户id': '', '密码': '', '身份': '业务人员', '业务单位': '', '所属机房': '' });

@@ -174,13 +174,24 @@
       <div class="hero"><div><h2>设置</h2><p>配置备份策略、审核保留数量和系统用户。</p></div></div>
       <form id="settingsForm" class="card form-grid">
         <label>备份副本数<input id="backupKeepCount" name="backup_keep_count" type="number" min="0"></label>
+        <label>自动备份保留数<input id="autoBackupKeep" name="auto_backup_keep" type="number" min="0"></label>
         <label>审核状态保存上限<input id="auditKeepCount" name="audit_keep_count" type="number" min="0"></label>
+        <label class="wide">快照目录<input id="snapshotDir" name="snapshot_dir" placeholder="留空 = data/backups；也可填 cron 备份所在目录，如 /home/cyn/backup/server-management-zips"></label>
         <label>启用通知<input id="notifyEnabled" name="notify_enabled" type="checkbox" value="1"></label>
         <label>通知格式<select id="notifyMessageType" name="notify_message_type"><option value="markdown">markdown</option><option value="text">text</option></select></label>
         <label class="wide">备份后命令<input id="backupCommand" name="backup_command"></label>
         <label class="wide">通知 Webhook URL<input id="notifyWebhookUrl" name="notify_webhook_url" placeholder="https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=..."></label>
         <div class="modal-actions wide"><button class="btn danger" id="resetFlowStateBtn" type="button">重置流程状态</button><button class="btn ghost" id="manualBackupBtn" type="button">手动备份</button><button class="btn primary" type="submit">保存设置</button></div>
       </form>
+      <div class="table-card card">
+        <div class="table-meta"><b>数据恢复</b><button id="refreshSnapshotsBtn" class="btn ghost" type="button">重新扫描</button></div>
+        <p class="muted" id="snapshotHint">扫描快照目录里的备份包与手动备份；恢复会用选中的快照覆盖三张正式表，恢复前会自动再备份一份当前状态，可随时撤回。</p>
+        <div class="snapshot-options">
+          <label><input type="checkbox" id="snapshotIncludeDb" checked> 同时恢复 app.db（审核记录、回收站、资料索引）</label>
+          <label><input type="checkbox" id="snapshotDropPending" checked> 恢复后作废待审批的变更与上下架申请</label>
+        </div>
+        <div id="snapshotList" class="snapshot-list"><p class="muted">加载中…</p></div>
+      </div>
       <div class="table-card card">
         <div class="table-meta"><b>字段标签管理</b><span class="muted">服务器表的「接入行情」「接入柜台」候选标签；只有管理人员能增删改，业务/机房人员只能在已有标签里选。</span></div>
         <div id="fieldOptionsPanels" class="tag-admin-grid"><p class="muted">加载中…</p></div>

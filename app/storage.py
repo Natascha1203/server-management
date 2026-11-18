@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import csv
+import hashlib
 import io
 import json
 import logging
@@ -352,6 +353,10 @@ def ensure_default_settings(conn):
         "notify_enabled": str(config["notify_enabled"]),
         "notify_webhook_url": config["notify_webhook_url"],
         "notify_message_type": config["notify_message_type"],
+        # 空串 = 沿用 data/backups；填了就是备份/快照根目录（恢复源 + manual/ 手动备份）
+        "snapshot_dir": "",
+        # 写操作前自动备份的保留份数（auto/ 目录），和人工备份的 backup_keep_count 分开
+        "auto_backup_keep": "20",
     }
     reset = config["reset"]
     for key, value in config_defaults.items():
@@ -362,6 +367,9 @@ def ensure_default_settings(conn):
     if reset:
         config["reset"] = 0
     conn.execute("INSERT OR IGNORE INTO settings (key,value) VALUES (?,?)", ("last_backup_at", ""))
+    conn.execute("INSERT OR IGNORE INTO settings (key,value) VALUES (?,?)", ("snapshot_dir", ""))
+    conn.execute("INSERT OR IGNORE INTO settings (key,value) VALUES (?,?)", ("last_restore_at", ""))
+    conn.execute("INSERT OR IGNORE INTO settings (key,value) VALUES (?,?)", ("auto_backup_hash", ""))
 
 
 def read_settings(conn=None):
@@ -378,6 +386,10 @@ def read_settings(conn=None):
             "notify_webhook_url": data.get("notify_webhook_url", ""),
             "notify_message_type": data.get("notify_message_type", "markdown") or "markdown",
             "last_backup_at": data.get("last_backup_at", ""),
+            "snapshot_dir": data.get("snapshot_dir", ""),
+            "last_restore_at": data.get("last_restore_at", ""),
+            "auto_backup_keep": int(data.get("auto_backup_keep") or 0),
+            "auto_backup_hash": data.get("auto_backup_hash", ""),
         }
     finally:
         if owns:
@@ -393,6 +405,10 @@ def write_settings(values, conn=None):
         "notify_webhook_url",
         "notify_message_type",
         "last_backup_at",
+        "snapshot_dir",
+        "last_restore_at",
+        "auto_backup_keep",
+        "auto_backup_hash",
     }
     owns = conn is None
     conn = conn or db()
@@ -726,20 +742,80 @@ def generate_user_api_token(user_id):
         return token
 
 
-def backup_sequence():
+def resolve_config_path(text, default=None):
+    """把配置里的路径解析成绝对路径：空串用 default，相对路径按 base_dir 解析。"""
+    text = clean_value(text)
+    if not text:
+        return Path(default) if default else None
+    path = Path(text).expanduser()
+    if not path.is_absolute():
+        path = Path(STATE["config"]["base_dir"]) / path
+    return path
+
+
+def snapshot_root():
+    """备份 / 快照根目录：恢复源与手动备份的共同父目录。
+
+    默认 data/backups；可在设置页改成 cron 备份所在的目录（如
+    /home/cyn/backup/server-management-zips），此时手动备份写到它下面的 manual/。
+    """
+    settings = read_settings()
+    configured = clean_value(settings.get("snapshot_dir"))
+    return resolve_config_path(configured, STATE["backups_dir"])
+
+
+def manual_backup_dir():
+    """手动备份固定落在根目录的 manual 子目录，和 cron 的 zip 分开，方便各自轮转。"""
+    return snapshot_root() / "manual"
+
+
+def auto_backup_dir():
+    """写操作前的自动备份落在 auto/，和人工备份分开放，轮转数量也各自独立。
+
+    单独一个目录是为了不把使用者手动留的备份挤掉：自动备份可能一天几十份，
+    如果和 manual/ 共用一个保留数，人工备份会被迅速轮转掉。
+    """
+    return snapshot_root() / "auto"
+
+
+def backup_dirs():
+    """扫描要覆盖的子目录名 → 目录路径。"""
+    return {"manual": manual_backup_dir(), "auto": auto_backup_dir()}
+
+
+def ensure_snapshot_root(path=None):
+    """确保快照根目录可用；不可用（不存在且建不出来 / 不是目录）时抛 ValueError。"""
+    root = Path(path) if path else snapshot_root()
+    try:
+        root.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        raise ValueError(f"快照目录不可用：{root}（{exc.strerror or exc}）") from exc
+    if not root.is_dir():
+        raise ValueError(f"快照目录不是目录：{root}")
+    return root
+
+
+def backup_sequence(directory=None):
+    """备份目录下的下一个空目录名（<目录>/B<时间>-<序号>）。"""
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    root = Path(directory) if directory else manual_backup_dir()
+    root.mkdir(parents=True, exist_ok=True)
     for index in range(1, 10000):
-        candidate = STATE["backups_dir"] / f"B{stamp}-{index:04d}"
+        candidate = root / f"B{stamp}-{index:04d}"
         if not candidate.exists():
             return candidate
     raise RuntimeError("无法生成备份目录")
 
 
-def prune_backups(keep_count):
+def prune_backups(directory, keep_count):
+    """只清理指定子目录：cron 产出的 zip 由它自己的脚本负责轮转，系统不碰。"""
     if keep_count <= 0:
-        return
-    backups_dir = STATE["backups_dir"]
+        return 0
+    backups_dir = Path(directory)
+    if not backups_dir.is_dir():
+        return 0
     backups = sorted([path for path in backups_dir.glob("B*") if path.is_dir()], key=lambda p: p.name, reverse=True)
+    removed = 0
     for path in backups[keep_count:]:
         resolved_backup = path.resolve()
         resolved_root = backups_dir.resolve()
@@ -750,6 +826,8 @@ def prune_backups(keep_count):
             continue
         if resolved_backup != resolved_root:
             shutil.rmtree(path, ignore_errors=True)
+            removed += 1
+    return removed
 
 
 def run_backup_command(command, cwd):
@@ -758,10 +836,48 @@ def run_backup_command(command, cwd):
     subprocess.run(command, cwd=cwd, shell=True, check=True)
 
 
-def create_backup(reason="manual"):
+# 自动备份指纹覆盖的表：settings 不在其中——指纹本身要写进 settings，
+# 把它算进去会让「备份后算的指纹」和「下次请求算的指纹」永远不相等。
+FINGERPRINT_TABLES = ("changes", "rack_requests", "attachments", "trash", "field_options")
+
+
+def official_fingerprint():
+    """三张正式表 + 相关业务表的内容指纹：判断「自上次自动备份以来有没有真的变过」。
+
+    用内容而不是 mtime：写接口在参数校验失败时不会改动任何东西，重复的无效请求
+    不该在 auto/ 里堆出一串一模一样的包。
+    """
+    digest = hashlib.sha256()
+    for entity in ("customers", "cabinets", "servers"):
+        path = STATE["official_dir"] / ENTITIES[entity]["filename"]
+        digest.update(path.name.encode("utf-8"))
+        try:
+            digest.update(path.read_bytes())
+        except OSError:
+            digest.update(b"<missing>")
+    with db() as conn:
+        for table in FINGERPRINT_TABLES:
+            try:
+                rows = conn.execute(f'SELECT * FROM "{table}" ORDER BY rowid').fetchall()
+            except sqlite3.Error:
+                continue
+            digest.update(("table:" + table).encode("utf-8"))
+            for row in rows:
+                digest.update(json.dumps(list(row), ensure_ascii=False, default=str).encode("utf-8"))
+    return digest.hexdigest()
+
+
+def create_backup(reason="manual", directory=None, keep_count=None, run_command=True):
+    """把三张正式表 + app.db + users.json 打包到一个 B<时间>-<序号>/ 目录。
+
+    directory 决定落在 manual/（人工、恢复前）还是 auto/（写前自动）；
+    keep_count 缺省时按目录取不同的保留数（人工用设置里的备份副本数，自动用自动备份保留数）。
+    run_command=False 时不执行设置里的「备份后命令」——写前自动备份会频繁触发，
+    每次都跑一遍外部命令既慢又不是使用者的意图。
+    """
     settings = read_settings()
-    STATE["backups_dir"].mkdir(parents=True, exist_ok=True)
-    target = backup_sequence()
+    target_dir = Path(directory) if directory else manual_backup_dir()
+    target = backup_sequence(target_dir)
     target.mkdir(parents=True, exist_ok=False)
     for entity in ("customers", "cabinets", "servers"):
         meta = ENTITIES[entity]
@@ -777,9 +893,30 @@ def create_backup(reason="manual"):
     }, ensure_ascii=False, indent=2), encoding="utf-8")
     write_settings({"last_backup_at": now_text()})
     try:
-        run_backup_command(settings.get("backup_command", ""), STATE["config"]["base_dir"])
+        if run_command:
+            run_backup_command(settings.get("backup_command", ""), STATE["config"]["base_dir"])
     finally:
-        prune_backups(int(settings.get("backup_keep_count") or 0))
+        if keep_count is None:
+            keep_count = (
+                int(settings.get("auto_backup_keep") or 0)
+                if target_dir.name == "auto"
+                else int(settings.get("backup_keep_count") or 0)
+            )
+        prune_backups(target_dir, int(keep_count))
+    return target
+
+
+def create_backup_if_changed(reason="pre-write", directory=None):
+    """写操作前的自动备份：内容与上次自动备份一致时跳过，返回 None。
+
+    调用方（HTTP 层）据此判断「这次写入有没有退路」。指纹在备份**之后**再取一次，
+    否则 create_backup 自己写的 last_backup_at 会让下一次比较永远不相等。
+    """
+    before = official_fingerprint()
+    if before == clean_value(read_settings().get("auto_backup_hash")):
+        return None
+    target = create_backup(reason, directory=directory or auto_backup_dir(), run_command=False)
+    write_settings({"auto_backup_hash": official_fingerprint()})
     return target
 
 

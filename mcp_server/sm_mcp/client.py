@@ -14,6 +14,11 @@ import urllib.request
 
 DEFAULT_BASE_URL = "http://127.0.0.1:18888"
 
+# 让后端在真正写入前先给自己留一份快照（写到 <snapshot_dir>/auto/）。
+# 后端只在写方法（POST/PUT/PATCH/DELETE）上理这个头，读请求带了也不产生备份。
+AUTO_BACKUP_HEADER = "X-SM-Auto-Backup"
+WRITE_METHODS = {"POST", "PUT", "PATCH", "DELETE"}
+
 
 class SMError(Exception):
     """可读的业务错误，直接作为工具结果返回给 agent。"""
@@ -30,6 +35,10 @@ class SMClient:
         except ValueError:
             self.timeout = 20.0
         self.verify = os.environ.get("SM_INSECURE", "") not in ("1", "true", "True")
+        # 写前自动备份开关；设 SM_AUTO_BACKUP=0 可关掉（后端磁盘紧张时用）
+        self.auto_backup = os.environ.get("SM_AUTO_BACKUP", "1") not in ("0", "false", "False")
+        # 最近一次请求触发的自动备份名（空 = 没备份，可能是内容没变）
+        self.last_auto_backup = ""
 
     # ---------------------------------------------------------------- 基础请求
 
@@ -54,9 +63,14 @@ class SMClient:
             headers["Content-Type"] = "application/json"
         if self.token:
             headers["Authorization"] = "Bearer " + self.token
+        # 写操作声明「改之前先备份」；后端会把实际生成的备份名回写在同名响应头里
+        self.last_auto_backup = ""
+        if self.auto_backup and method.upper() in WRITE_METHODS:
+            headers[AUTO_BACKUP_HEADER] = "1"
         request = urllib.request.Request(url, data=data, headers=headers, method=method)
         try:
             with urllib.request.urlopen(request, timeout=self.timeout, context=self._ssl_context()) as resp:
+                self.last_auto_backup = (resp.headers.get(AUTO_BACKUP_HEADER) or "").strip()
                 return resp.read()
         except urllib.error.HTTPError as exc:
             raise SMError(self._describe_http_error(exc.code, exc.read(), path)) from None

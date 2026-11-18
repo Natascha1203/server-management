@@ -13,10 +13,29 @@
 
 ## 下载
 
-页面左下角 🔑 →「⬇ 下载 MCP」→ 得到 `server_management_mcp.zip`，解压到固定位置
-（以后升级直接覆盖同名目录，配置不用改）。包由后端实时打包，永远等于当前线上代码。
+页面左下角 🔑 →「⬇ 下载 MCP」→ 得到 `server_management_mcp.zip`，解压到固定位置。
+包由后端实时打包，永远等于当前线上代码。
+
+解压出来的目录里，**只有 `run_server.py` 是长久的**——它是引导器，位置一旦配进 host 就不要动。
+真正的业务代码会被引导器在启动时装到用户主目录的「版本库」里，后端更新后自动替换：
+
+```
+~/.server-management-mcp/            Windows: C:\Users\<你>\.server-management-mcp\
+├── versions/
+│   ├── 1a2b3c4d5e6f/                ← 一份完整的代码（目录名 = 内容哈希）
+│   └── 9f8e7d6c5b4a/
+├── current.txt                      ← 一行文本：现在跑哪一份
+└── last_check.txt                   ← 上次问后端的时刻
+```
+
+所以以后更新不用再下载、不用改配置，**重启客户端就自动生效**（细节见文末「升级」）。
+版本库里只有代码，没有任何业务数据，token 不在里面，整个删掉也能自动重建。
 
 下面三节按你用的 host 挑一节看。
+
+> **已经装过旧版的用户**：旧版 `run_server.py` 没有自更新能力，需要**重新下载一次 zip、
+> 覆盖解压到原目录**（host 配置里的路径不变，不用重跑 `install_config.py`）。这一次之后
+> 就都自动了。
 
 ## 1. WorkBuddy 桌面版
 
@@ -125,7 +144,8 @@ WorkBuddy 和 CodeBuddy 粘的都是这一份，只改两个占位符：
 
 - `command` 用哪个 python 都行（零依赖，3.7+ 即可），但**必须写绝对路径**——host 不保证
   工作目录和 PATH。Windows 路径用正斜杠 `C:/...` 或双反斜杠 `C:\\...`。
-- `args` 指向解压出来的 `run_server.py`，同样写绝对路径。
+- `args` 指向解压出来的 `run_server.py`，同样写绝对路径。这个路径**装好后就别改**：
+  业务代码的更新由引导器自己处理，配置一年不动也不会过期。
 
 不想手拼 JSON，可以用脚本写配置（会先备份、原子写入）：
 
@@ -138,6 +158,63 @@ python server_management_mcp/install_config.py --host workbuddy \
 加 `--dry-run` 只预览不落盘。注意它**整体替换** `server-management` 这一条，手改过的字段
 （比如 `disabled`）会丢，所以配置已经调好时直接改文件、别重跑。
 
+## 升级
+
+**正常情况下什么都不用做。** 每次客户端启动 MCP 时，引导器会先问一句后端
+`GET /api/mcp/version`（只回一个 12 位版本号，几十字节）：
+
+| 情况 | 引导器的动作 |
+|---|---|
+| 版本一致 | 直接启动，无额外开销 |
+| 版本不同 | 下载整包 → 解压到 `versions/<新版本>/` → 把 `current.txt` 改指过去 → 用新代码启动 |
+| 后端不可达 / token 失效 | **照常启动**，用现有版本，stderr 记一行 |
+
+所以「更新生效」的时机是**下一次启动**，也就是：新开一个会话、重启 host、或在
+WorkBuddy 连接器页点重连。当前会话里不会中途换代码（Python 模块启动时就加载了）。
+
+版本号可以在任何一次 `sm_bootstrap` 的返回里看到：
+
+```
+## 版本
+- 客户端代码 9f8e7d6c5b4a · 后端 9f8e7d6c5b4a（一致）
+```
+
+出现「**客户端偏旧**」就重启客户端，不用重装。
+
+### 回滚到旧版
+
+旧版本目录不会被立刻删除（默认留 3 份）。想退回去，把 `current.txt` 改成想要的目录名即可：
+
+```bash
+# 看有哪些版本
+ls ~/.server-management-mcp/versions
+# 退回某一版（Windows 是 C:\Users\<你>\.server-management-mcp\current.txt）
+echo 1a2b3c4d5e6f > ~/.server-management-mcp/current.txt
+```
+
+下次启动就用那一版。注意 `current.txt` 里写的必须是 `versions/` 下真实存在的目录名，
+否则按「未安装」处理并重新下载当前版本。
+
+### 可调的环境变量
+
+写进 host 配置的 `env` 里即可，不写就是默认值：
+
+| 变量 | 默认 | 作用 |
+|---|---|---|
+| `SM_MCP_HOME` | `~/.server-management-mcp` | 版本库位置 |
+| `SM_MCP_AUTO_UPDATE` | `1` | 设 `0` 关闭自动更新：只检查、在日志里提示有新版本，不下载 |
+| `SM_MCP_CHECK_TTL` | `60` | 两次版本检查的最小间隔（秒）。设 `0` = 每次启动都查；后端挂了想少等就用默认值 |
+| `SM_MCP_KEEP_VERSIONS` | `3` | 保留几份历史版本（当前在用的那份永不删） |
+
+想验证到底更新了没，直接跑一次（会把引导器日志打在 stderr）：
+
+```bash
+SM_BASE_URL=<后端地址> SM_TOKEN=<token> python <解压目录>/server_management_mcp/run_server.py
+```
+
+正常会看到 `已更新 xxx -> yyy`（有更新时）或什么都不打（已最新），然后进入等待 stdin 的
+状态——按 Ctrl+C 退出即可。
+
 ## 连不上时看这里
 
 | 现象 | 处理 |
@@ -147,6 +224,9 @@ python server_management_mcp/install_config.py --host workbuddy \
 | 工具比预期少 | 身份裁剪：业务/机房人员本来就没有 `sm_review`、`sm_pending` |
 | 「token 无效或已失效」 | 去页面重新获取一枚，更新后重连 |
 | 握手失败 | `command` 路径不可执行，或 python 解释器不存在 |
+| 后端明明更新了，工具还是旧的 | 当前会话已经加载过旧模块。**新开会话 / 重启 host** 才会换；也可以看 `sm_bootstrap` 的「版本」段确认 |
+| `sm_bootstrap` 说「客户端偏旧」 | 同上，重启即可，引导器会自动下载新版 |
+| 想确认版本库状态 | 看 `~/.server-management-mcp/current.txt` 与 `versions/` 目录；`SM_MCP_AUTO_UPDATE=0` 时不会自动下载 |
 
 绕过 host 直接确认进程本身是好的（会打印工具列表）：
 

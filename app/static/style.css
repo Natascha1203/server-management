@@ -202,6 +202,21 @@ mark{background:#ffe9a8;color:inherit;padding:0 2px;border-radius:3px}
 .trash-add-form .review-actions{grid-column:1/-1;justify-content:flex-start}
 .trash-add-form label{font-size:12px;color:#526671}
 
+/* 数据恢复：快照列表 */
+.snapshot-options{display:flex;flex-wrap:wrap;gap:16px;margin:12px 0 4px;font-size:12px;color:#526671}
+.snapshot-options label{display:flex;align-items:center;gap:6px;cursor:pointer}
+.snapshot-list{display:flex;flex-direction:column;gap:8px;margin-top:10px}
+.snapshot-card{display:flex;align-items:flex-start;gap:14px;justify-content:space-between;border:1px solid var(--line);border-radius:10px;padding:12px 14px;background:#fbfdfe}
+.snapshot-card.invalid{background:#fdf7f5;border-color:#f0d5cc}
+.snapshot-main{min-width:0;flex:1}
+.snapshot-title{display:flex;align-items:center;gap:8px;flex-wrap:wrap;font-size:13px}
+.snapshot-title strong{font-weight:600;word-break:break-all}
+.snapshot-meta{display:flex;gap:14px;flex-wrap:wrap;margin-top:5px;font-size:12px;color:var(--muted)}
+.snapshot-error{color:#b6482f;margin:6px 0 0;font-size:12px}
+.snapshot-actions{flex:0 0 auto;display:flex;align-items:center;gap:8px}
+.tag.good{background:#e8f5ee;color:#1d6b46}
+@media(max-width:760px){.snapshot-card{flex-direction:column}.snapshot-actions{width:100%;gap:8px}.snapshot-actions .btn{flex:1}}
+
 /* ---------------------------------------------------------------- 表单卡片：留白与网格
    .card 自身不带内边距，表单直接当卡片用会贴边；这里统一给卡片内表单留白 */
 .card.form-grid{padding:20px 22px 18px}

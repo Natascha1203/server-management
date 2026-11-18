@@ -68,6 +68,7 @@ SCHEMA_RULES = [
     "资料（附件）按序列号归属，不进入任何 Excel/CSV 导出；回收站永久删除会连带清理该序列号的资料。",
     "servers 的 `用途分类` / `接入行情` / `接入柜台` 是多值标签字段：存 `A, B` 文本，写入时也接受数组，服务端会去重并按 `, ` 拼接；各字段候选池见 GET /api/field-options。",
     "回收站权限：管理人员可查看全部记录、手动登记、修改信息、重新上架、永久删除；机房人员只看本机房，可查看、修改信息与重新上架（不可手动登记、不可永久删除）。`PATCH /api/trash/<id>` 只把整行字段存回回收站（不上架、不做完整校验，只挡序列号为空或重复）；`POST /api/trash/<id>/restore` 才写回服务器表，并按服务器表重新校验客户、机柜机位与 IP。两处都能修改**整行任意字段**（含序列号，改名后该序列号的资料附件一起迁移）。",
+    "备份与恢复：快照根目录由设置 `snapshot_dir` 决定（空=data/backups），人工备份在 `manual/`、写前自动备份在 `auto/`、cron 的 `data_*.zip` 在根目录。写请求带 `X-SM-Auto-Backup: 1` 时服务端会在改动前自动快照，内容没变则跳过。`GET /api/snapshots` 列出全部快照，`POST /api/snapshots/restore`（需 `confirm=\"RESTORE\"`）恢复三张正式表 + 可选 app.db（`settings`/`versions` 永不覆盖，`users.json` 永不恢复），`DELETE /api/snapshots` 删除指定快照。恢复前会自动生成一份 pre-restore 备份，可用于撤回。",
 ]
 
 

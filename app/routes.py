@@ -5,6 +5,7 @@ import hashlib
 import io
 import json
 import logging
+import shutil
 import zipfile
 from datetime import datetime
 from functools import wraps
@@ -12,7 +13,7 @@ from pathlib import Path
 
 from flask import Blueprint, Response, g, jsonify, redirect, render_template, request, send_file, session, url_for
 
-from . import mcp_package, services, skill_docs, storage
+from . import mcp_package, services, skill_docs, snapshots, storage
 from .config import legacy_role_name, role_code
 from .core import (
     ENTITIES,
@@ -192,6 +193,27 @@ def download_skill():
         download_name="server_management_skill.zip",
         mimetype="application/zip",
     )
+
+
+@bp.get("/api/mcp/version")
+@require_login
+def mcp_version():
+    """只回报版本号，不打包。
+
+    客户端的自更新引导器（run_server.py）每次启动先问这里：版本一致就跳过下载，
+    不一致才去 /api/mcp/download 拉整包。单独一个轻端点是为了让「启动」这个高频动作
+    只花一次 JSON 往返，而不是拖一个 70KB 的 zip。
+    """
+    root = mcp_package.mcp_dir(storage.STATE["config"])
+    if not root.is_dir():
+        return jsonify({"error": "MCP 服务目录不存在：%s（可用 app.ini 的 mcp_dir 指定）" % root}), 404
+    try:
+        version = mcp_package.package_version(root)
+        files = sum(1 for _ in mcp_package.iter_files(root))
+    except OSError as exc:
+        logger.warning("计算 MCP 版本失败：%s", exc)
+        return jsonify({"error": "计算 MCP 版本失败：%s" % exc}), 500
+    return jsonify(version=version, files=files)
 
 
 @bp.get("/api/mcp/download")
@@ -1073,10 +1095,18 @@ def settings_api():
     body = request.get_json(silent=True) or {}
     try:
         notification_settings = storage.validate_notification_settings(body)
+        snapshot_dir = clean_value(body.get("snapshot_dir", ""))
+        if snapshot_dir:
+            # 先建一次目录，填错路径（不存在又建不出来 / 是文件）当场返回 400，
+            # 不要等到半夜 cron 或恢复时才发现
+            storage.ensure_snapshot_root(storage.resolve_config_path(snapshot_dir))
         settings = storage.write_settings({
             "backup_keep_count": int(body.get("backup_keep_count", 0)),
             "backup_command": body.get("backup_command", ""),
             "audit_keep_count": int(body.get("audit_keep_count", 0)),
+            # 快照根目录：留空 = data/backups；相对路径按 base_dir 解析
+            "snapshot_dir": snapshot_dir,
+            **({"auto_backup_keep": int(body["auto_backup_keep"])} if "auto_backup_keep" in body else {}),
             **notification_settings,
         })
     except (TypeError, ValueError) as exc:
@@ -1097,6 +1127,160 @@ def run_backup_api():
     except subprocess.CalledProcessError as exc:
         return jsonify(error=f"备份命令执行失败：{exc}"), 500
     return jsonify(message="备份已完成", backup=target.name)
+
+
+# ---------------------------------------------------------------- 写前自动备份
+# 集成方（MCP 客户端等）在写请求上带 X-SM-Auto-Backup: 1，声明「改之前先留一份退路」。
+# 服务端在分发前把三张正式表 + app.db 快照到 <snapshot_dir>/auto/B*，名字回写到响应头，
+# 调用方就能告诉使用者「要撤回的话恢复到哪一份」。
+# 内容与上次自动备份完全一致时跳过：校验失败的无效请求不该在 auto/ 里堆一模一样的包。
+
+AUTO_BACKUP_HEADER = "X-SM-Auto-Backup"
+AUTO_BACKUP_METHODS = {"POST", "PUT", "PATCH", "DELETE"}
+# 这些端点不需要（或不应该）触发自动备份
+AUTO_BACKUP_SKIP_PREFIXES = (
+    "/api/snapshots",       # 快照管理本身；恢复自己会生成 pre-restore 快照
+    "/api/backups/run",     # 备份本身
+    "/api/my-token",        # 只改 users.json 里的 token，不算台账数据
+)
+
+
+def _auto_backup_wanted():
+    if request.method not in AUTO_BACKUP_METHODS:
+        return False
+    flag = clean_value(request.headers.get(AUTO_BACKUP_HEADER)).lower()
+    if flag not in ("1", "true", "yes", "on"):
+        return False
+    path = request.path
+    if not path.startswith("/api/"):
+        return False
+    return not any(path.startswith(prefix) for prefix in AUTO_BACKUP_SKIP_PREFIXES)
+
+
+@bp.before_request
+def auto_backup_before_write():
+    """写前自动备份。备份失败就中止本次写入——没有退路的写入不做。"""
+    if not _auto_backup_wanted():
+        return None
+    try:
+        with storage.LOCK:
+            target = storage.create_backup_if_changed("pre-write")
+    except (OSError, ValueError, RuntimeError) as exc:
+        logger.warning("auto backup before write failed path=%s error=%s", request.path, exc)
+        return jsonify(
+            error=f"写前自动备份失败，已中止本次操作（{exc}）。"
+                  "请检查设置里的快照目录是否可写，或去掉请求头 X-SM-Auto-Backup 后重试。"
+        ), 500
+    if target is not None:
+        g.auto_backup_name = target.name
+        logger.info("auto backup before write name=%s path=%s", target.name, request.path)
+    return None
+
+
+@bp.after_request
+def expose_auto_backup_name(response):
+    name = g.get("auto_backup_name", "")
+    if not name:
+        return response
+    if response.status_code >= 400:
+        # 请求没成功、数据也一个字节没动（指纹与备份后一致）——这份备份不含任何信息，
+        # 留着只会在 auto/ 里堆一串同样的包，直接删掉且不对外声明。
+        try:
+            unchanged = storage.official_fingerprint() == clean_value(
+                storage.read_settings().get("auto_backup_hash")
+            )
+        except (OSError, ValueError):
+            unchanged = False
+        if unchanged:
+            shutil.rmtree(storage.auto_backup_dir() / name, ignore_errors=True)
+            logger.info("auto backup discarded (request failed, data unchanged) name=%s", name)
+            return response
+    response.headers[AUTO_BACKUP_HEADER] = name
+    return response
+
+
+# ---------------------------------------------------------------- 快照（备份）扫描、恢复与删除
+# 快照根目录由设置 snapshot_dir 决定（默认 data/backups）；人工备份写在 manual/，
+# 写前自动备份写在 auto/。恢复只覆盖三张正式表的 xlsx；app.db 可选按表覆盖；
+# users.json 永不恢复（见 snapshots.py）。
+
+@bp.get("/api/snapshots")
+@require_login
+def snapshots_api():
+    user = current_user()
+    if "manage_settings" not in capabilities_for(user):
+        return forbidden()
+    payload = snapshots.scan()
+    settings = storage.read_settings()
+    return jsonify(
+        root=payload["root"],
+        exists=payload["exists"],
+        scan_error=payload["error"],
+        items=payload["items"],
+        manual_dir=str(storage.manual_backup_dir()),
+        auto_dir=str(storage.auto_backup_dir()),
+        last_backup_at=settings.get("last_backup_at", ""),
+        last_restore_at=settings.get("last_restore_at", ""),
+        auto_backup_keep=settings.get("auto_backup_keep", 0),
+    )
+
+
+@bp.post("/api/snapshots/preview")
+@require_login
+def snapshot_preview_api():
+    user = current_user()
+    if "manage_settings" not in capabilities_for(user):
+        return forbidden()
+    body = request.get_json(silent=True) or {}
+    try:
+        with storage.LOCK:
+            return jsonify(snapshot=snapshots.preview(body.get("snapshot")))
+    except snapshots.SnapshotError as exc:
+        return jsonify(error=str(exc)), 400
+
+
+@bp.post("/api/snapshots/restore")
+@require_login
+def snapshot_restore_api():
+    user = current_user()
+    if "manage_settings" not in capabilities_for(user):
+        return forbidden()
+    body = request.get_json(silent=True) or {}
+    if clean_value(body.get("confirm")) != "RESTORE":
+        return jsonify(error="请先确认：恢复会用快照内容覆盖当前正式表"), 400
+    try:
+        with storage.LOCK:
+            result = snapshots.restore(
+                body.get("snapshot"),
+                actor=user["用户id"],
+                include_db=body.get("include_db", True) is not False,
+                drop_pending=body.get("drop_pending", True) is not False,
+            )
+    except snapshots.SnapshotError as exc:
+        return jsonify(error=str(exc)), 400
+    message = f"已恢复到快照 {result['snapshot']}；恢复前状态已备份为 {result['backup_before_restore']}"
+    return jsonify(message=message, **result)
+
+
+@bp.delete("/api/snapshots")
+@require_login
+def snapshot_delete_api():
+    """删除备份包 / 备份目录。只接受 /api/snapshots 扫描出来的名字。"""
+    user = current_user()
+    if "manage_settings" not in capabilities_for(user):
+        return forbidden()
+    body = request.get_json(silent=True) or {}
+    name = clean_value(body.get("snapshot") or request.args.get("snapshot"))
+    try:
+        with storage.LOCK:
+            result = snapshots.delete_snapshot(name)
+    except snapshots.SnapshotError as exc:
+        return jsonify(error=str(exc)), 400
+    logger.info("snapshot deleted name=%s actor=%s", result["snapshot"], user["用户id"])
+    return jsonify(
+        message=f"已删除 {result['snapshot']}，剩余 {result['remaining']} 份备份",
+        **result,
+    )
 
 
 @bp.post("/api/flow-state/reset")

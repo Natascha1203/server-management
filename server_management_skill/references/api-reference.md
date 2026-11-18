@@ -245,7 +245,8 @@ files=<file1> & files=<file2> ...   # 也接受 file 字段名
   - `rooms` 为**按机房分组**的机柜列表，用于页面按机房分区展示；`cabinets` 为扁平列表（兼容旧用法）。
   - 每个机位：`{slot, status, servers:[...], occupied_by, pending_server?, pending_change_id?, pending_request_id?}`；`status` 取值 `free`/`occupied`/`pending_occupied`/`pending_release`/`pending_implementation`。
 - 版本记录（管理员）：`GET /api/versions`、`GET /api/versions/<version_id>/<entity>/download`
-- 设置（管理员）：`GET/PUT /api/settings`
+- 备份与恢复（管理员）：见 2.10
+- 设置（管理员）：`GET/PUT /api/settings`（新增 `snapshot_dir`：快照根目录，留空 = `data/backups`）
 - 系统用户（管理员）：`GET/PUT /api/system-users`
 - 填写说明：`GET /api/filling-instructions`
 - 健康检查（无需鉴权）：`GET /health`
@@ -282,7 +283,68 @@ Token 不再需要手工写 `data/users.json`，也**不存在管理员代发**�
 - 常见错误：`403` 用 token 换发 / 非管理员访问用户表；`404` 当前账号不在用户配置中；`401` 未登录。
 
 
-### 2.10 skill 文档分发（免鉴权只读）
+### 2.10 备份快照与全量恢复（管理员）
+
+快照根目录由设置 `snapshot_dir` 决定，默认 `data/backups`；可指向运维 cron 打包的目录（如
+`/home/cyn/backup/server-management-zips`）。系统的手动备份固定写到它的 **`manual/` 子目录**，
+与 cron 的 `data_*.zip` 分开，各自的轮转互不干扰（`backup_keep_count` 只管 `manual/`）。
+
+扫描识别四种载体（其余文件忽略）：
+
+| 载体 | 来源 | 内容 |
+|---|---|---|
+| `data_YYYYMMDD.zip` | 运维 cron（`scripts/backup.sh`） | `data/official/*.xlsx` + `data/app.db` + `data/users.json` |
+| `manual/B<时间>-<序号>/` | `POST /api/backups/run`、恢复前自动生成 | 三张 xlsx + `app.db` + `users.json` + `backup.json` |
+| `auto/B<时间>-<序号>/` | **写前自动备份**（见下） | 同上 |
+| `B<时间>-<序号>/`（根目录） | 旧版手动备份 | 同上，只读 |
+
+**写前自动备份**：任何写请求（POST/PUT/PATCH/DELETE）只要带请求头
+`X-SM-Auto-Backup: 1`，服务端就会在**分发前**把当前三张正式表 + `app.db` 快照到 `auto/`，
+并把生成的备份名回写到同名响应头里。
+- 内容与上次自动备份完全一致时跳过（校验失败的无效请求不会堆出一串同样的包）；
+  请求返回 4xx/5xx 且数据确实没动时，那份刚做的备份会被丢弃、响应头也不带。
+- 备份失败 → 请求直接 500 中止，不会「没退路还照改」。
+- 轮转份数由设置 `auto_backup_keep` 控制（默认 20），与人工备份的 `backup_keep_count` 独立，
+  互不挤占。
+- MCP 的写工具（`sm_upsert` / `sm_delete` / `sm_review` / `sm_rack_submit` / `sm_rack_review`）
+  默认都带这个头，返回里的 `auto_backup` 就是本次改之前的快照名；设环境变量
+  `SM_AUTO_BACKUP=0` 可关闭。
+
+**扫描**：`GET /api/snapshots`
+→ `{"root":"...","exists":true,"scan_error":"","manual_dir":"...","auto_dir":"...","auto_backup_keep":20,
+"last_backup_at":"","last_restore_at":"",
+"items":[{"name","kind":"zip|dir","origin":"cron|manual|auto|legacy","size","mtime","has_db","has_users","valid","errors":[]}]}`
+- `name` 是相对根目录的路径，**恢复/删除时原样回传**；不存在的名字一律拒绝（不接受任意路径）。
+- `valid=false` 表示缺表或压缩包读不出来，不能恢复。
+
+**预览**：`POST /api/snapshots/preview`，Body `{"snapshot":"data_20261103.zip"}`
+→ `{"snapshot":{...,"tables":[{"entity","label","filename","records","missing","extra"}],
+"missing_columns":{},"extra_columns":{},"db_tables":[],"restorable":true}}`
+
+**恢复**：`POST /api/snapshots/restore`
+```json
+{"snapshot": "data_20261103.zip", "include_db": true, "drop_pending": true, "confirm": "RESTORE"}
+```
+- `confirm` 必须是 `RESTORE`，否则 400（防误点）。
+- 覆盖面：**只有三张正式表**（客户 / 机柜 / 服务器 xlsx）。不支持只恢复某一张表。
+- `include_db`（默认 `true`）：按表覆盖 `changes` / `rack_requests` / `attachments` / `trash` / `field_options`。
+  `settings` 与 `versions` **永不覆盖**（前者含本页配置本身，后者指向可能已被轮转的快照目录）。
+  快照没有 `app.db` 时自动降级为只恢复 Excel，并在返回的 `db_skipped=true` 里说明。
+- `drop_pending`（默认 `true`）：恢复后把所有 `pending` 的变更与上下架请求置为 rejected
+  （原因「数据已恢复到快照，申请作废」），避免审批一条 `record_key` 已经不存在的申请。
+- **`users.json` 永不恢复**：账号 / 密码 / token 是启动时读进内存的，文件覆盖不生效且会让权限错乱。
+- 恢复前会自动执行一次手动备份（返回的 `backup_before_restore`），因此这次恢复本身可撤销：
+  在快照列表里选那个 `B*` 再恢复一次即可。
+- 表头不兼容（快照缺当前版本的列）时整个请求 400 且**不改动任何文件**。
+- 返回还包含一致性体检：`trash_back_in_servers`（回收站里的序列号又回到服务器表）、
+  `attachment_orphans`（附件指向的序列号已不在服务器表）。只报告，不自动改。
+
+**删除备份**：`DELETE /api/snapshots`，Body `{"snapshot":"data_20261103.zip"}`
+- 可删 `*.zip`（定时备份包）与任意 `B*` 备份目录（manual / auto / legacy）。
+- 名字必须是扫描结果里出现过的；解析后的真实路径必须仍在快照根目录内（挡 `../` 与符号链接）。
+- 不可恢复：删掉的那份备份就再也无法用来回滚。返回 `{"snapshot","kind","remaining"}`。
+
+### 2.11 skill 文档分发（免鉴权只读）
 
 供 MCP server 与 agent 获取**当前实现**的字段与文档，避免手写副本过期。
 
@@ -296,17 +358,25 @@ Token 不再需要手工写 `data/users.json`，也**不存在管理员代发**�
 - **给 `ENTITIES` 加一列 → 重启后端 → `schema` 立刻多出该列，`manifest.version` 随之变化**。MCP 与 skill 都不用改，这是「字段永不过期」的实现方式。
 - 文档正文按 `docs/` → `server_management_skill/` → `server_management_skill/references/` 顺序探测，不维护第二份副本；文档名走白名单，`../` 之类一律 400/404。
 - 与 2.6 的 `GET /api/skill/download`（需登录、返回 zip）并存：后者是给不支持 MCP 的 host 的兜底。
-- 页面上的下载入口现在下载的是 **MCP 包**（见 2.10），不是 skill zip。
+- 页面上的下载入口现在下载的是 **MCP 包**（见 2.12），不是 skill zip。
 
-### 2.11 MCP 服务包下载（需登录）
+### 2.12 MCP 服务包下载（需登录）
 
 | 端点 | 权限 | 说明 |
 |---|---|---|
+| `GET /api/mcp/version` | 登录即可 | 只回版本号与文件数：`{"version":"9f8e7d6c5b4a","files":12}`，不打包 |
 | `GET /api/mcp/download` | 登录即可 | **实时**打包 `app.ini` 的 `mcp_dir`（留空 = 项目根 `mcp_server/`），返回 `server_management_mcp.zip`，响应头带 `X-MCP-Version` |
 
+- **版本号统一**：`/api/mcp/version` 的 `version` 与下载包的 `X-MCP-Version` 是同一个值
+  （包内文件「相对路径 + 内容」的 sha256 前 12 位，与 mtime 无关）。
+- **`/api/mcp/version` 的存在意义**：MCP 客户端的引导器（`run_server.py`）每次启动先问这里，
+  一致就跳过下载，不一致才去 `/api/mcp/download` 拉整包。把「启动」这个高频动作压成
+  一次几十字节的 JSON 往返，而不是每次都拖一个 70KB 的 zip。
+- **客户端自更新**：`run_server.py` 把代码装到 `~/.server-management-mcp/versions/<版本>/`，
+  用 `current.txt` 指向当前版本；新版本写新目录、切换只改一行文本，旧版本保留可回滚。
+  后端不可达时照常启动（用现有版本），不阻塞握手。
 - **不预生成包**：每次请求现场 zip，包内文件 = 当前磁盘代码，因此不会出现「客户端拿到的包里没有某个新工具」。改完 `mcp_server/` 不必记得重打包。
 - 包内顶层目录固定 `server_management_mcp/`，解压后直接 `python server_management_mcp/install_config.py --host both --base-url ... --token ...`；`__pycache__` / `*.pyc` 已排除。
-- `X-MCP-Version` = 包内文件「相对路径 + 内容」的 sha256 前 12 位，与 mtime 无关：同样的代码在任何机器上版本一致，可用来判断「是旧包还是旧进程」。
 - `mcp_dir` 指错或目录不存在 → `404`，错误文案里会带实际查找路径。
 - 页面入口：左下角钥匙 →「⬇ 下载 MCP」。
 

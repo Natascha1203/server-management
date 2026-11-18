@@ -778,3 +778,76 @@ class TestEndToEndWrite:
         assert "sm_review" not in names and "sm_pending" not in names
         admin_names = list_tools(api_client(live, "admin"))
         assert "sm_review" in admin_names and "sm_pending" in admin_names
+
+
+class TestAutoBackupBeforeWrite:
+    """写工具必须让后端在落库前先备份——这是「MCP 改坏了能退回去」的唯一保障。"""
+
+    def test_write_returns_auto_backup_name(self, live):
+        from app import storage
+
+        client = api_client(live, "admin")
+        json.loads(mcp_tools.call_tool(
+            "sm_upsert", {"entity": "customers", "row": {"客户id": "91000001", "名称": "备份验证"}}, client
+        ))
+        created = json.loads(mcp_tools.call_tool(
+            "sm_upsert", {"entity": "cabinets", "row": {"机房": "机房B", "机柜": "B01", "机位": "1-10"}}, client
+        ))
+        # 第二次写才会真正产生「新内容」的备份（第一次写之后状态已变）
+        assert "auto_backup" in created, created
+        name = created["auto_backup"]
+        assert name.startswith("B")
+        backup_dir = storage.auto_backup_dir() / name
+        assert backup_dir.is_dir()
+        # 备份里是写入前的状态：还没有这次新建的机柜
+        from openpyxl import load_workbook
+        wb = load_workbook(backup_dir / "机柜信息表.xlsx", data_only=True)
+        cabinets = [row[0] for row in wb[wb.sheetnames[0]].iter_rows(min_row=2, values_only=True)]
+        wb.close()
+        assert "机房B" not in cabinets
+        assert "restore_hint" in created and "数据恢复" in created["restore_hint"]
+
+    def test_read_tools_do_not_trigger_backup(self, live):
+        from app import storage
+
+        client = api_client(live, "admin")
+        mcp_tools.call_tool("sm_stats", {}, client)
+        mcp_tools.call_tool("sm_query", {"entity": "servers"}, client)
+        assert not list(storage.auto_backup_dir().glob("B*"))
+
+    def test_delete_also_backed_up(self, live):
+        from app import storage
+
+        client = api_client(live, "admin")
+        json.loads(mcp_tools.call_tool(
+            "sm_upsert", {"entity": "customers", "row": {"客户id": "91000002", "名称": "待删"}}, client
+        ))
+        json.loads(mcp_tools.call_tool(
+            "sm_upsert", {"entity": "cabinets", "row": {"机房": "机房C", "机柜": "C01", "机位": "1-10"}}, client
+        ))
+        before = len(list(storage.auto_backup_dir().glob("B*")))
+        deleted = json.loads(mcp_tools.call_tool(
+            "sm_delete", {"entity": "cabinets", "keys": [{"机房": "机房C", "机柜": "C01"}],
+                          "confirm_keys": [{"机房": "机房C", "机柜": "C01"}]},
+            client,
+        ))
+        assert deleted["applied"] is True, deleted
+        assert deleted.get("auto_backup"), deleted
+        assert len(list(storage.auto_backup_dir().glob("B*"))) == before + 1
+
+    def test_env_can_disable_auto_backup(self, live, monkeypatch):
+        """SM_AUTO_BACKUP=0 时不带这个头（磁盘紧张时的逃生口）。"""
+        from app import storage
+        from mcp_server.sm_mcp.client import SMClient
+
+        monkeypatch.setenv("SM_AUTO_BACKUP", "0")
+        token = storage.get_users()["admin"]["api_token"] or storage.generate_user_api_token("admin")
+        client = SMClient(base_url=live, token=token)
+        assert client.auto_backup is False
+        json.loads(mcp_tools.call_tool(
+            "sm_upsert", {"entity": "customers", "row": {"客户id": "91000003", "名称": "关备份"}}, client
+        ))
+        json.loads(mcp_tools.call_tool(
+            "sm_upsert", {"entity": "cabinets", "row": {"机房": "机房D", "机柜": "D01", "机位": "1-10"}}, client
+        ))
+        assert not list(storage.auto_backup_dir().glob("B*"))
