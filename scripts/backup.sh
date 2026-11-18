@@ -35,16 +35,19 @@ if [ ! -d "$DATA_DIR" ]; then
 fi
 
 mkdir -p "$BACKUP_DIR" || { log "错误：无法创建 $BACKUP_DIR"; exit 1; }
+# 打包根：保持 data/ 前缀，和系统「快照目录」的识别规则一致（zip 里要有 data/official/*.xlsx）
+mkdir -p "$TMP_DIR/data"
 
-# 1) app.db 用 sqlite3 .backup 取一致快照
+# 1) app.db 用 sqlite3 .backup 取一致快照（必须落在 $TMP_DIR/data/ 下，否则不会被打进包）
+DB_OUT="$TMP_DIR/data/app.db"
 if [ -f "$DATA_DIR/app.db" ]; then
     if command -v sqlite3 >/dev/null 2>&1; then
-        if sqlite3 "$DATA_DIR/app.db" ".backup '$TMP_DIR/app.db'"; then
+        if sqlite3 "$DATA_DIR/app.db" ".backup '$DB_OUT'"; then
             log "app.db 已用 sqlite3 .backup 导出"
         else
-            cp -f "$DATA_DIR/app.db" "$TMP_DIR/app.db" && log "警告：sqlite3 .backup 失败，退回 cp"
+            cp -f "$DATA_DIR/app.db" "$DB_OUT" && log "警告：sqlite3 .backup 失败，退回 cp"
         fi
-    elif [ -x "$PYTHON_BIN" ] && "$PYTHON_BIN" - "$DATA_DIR/app.db" "$TMP_DIR/app.db" <<'PY'
+    elif [ -x "$PYTHON_BIN" ] && "$PYTHON_BIN" - "$DATA_DIR/app.db" "$DB_OUT" <<'PY'
 import sqlite3, sys
 src, dst = sys.argv[1], sys.argv[2]
 with sqlite3.connect(src) as s, sqlite3.connect(dst) as d:
@@ -53,12 +56,16 @@ PY
     then
         log "app.db 已用 python sqlite3.backup 导出"
     else
-        cp -f "$DATA_DIR/app.db" "$TMP_DIR/app.db" && log "警告：无 sqlite3 / python 可备份，退回 cp"
+        cp -f "$DATA_DIR/app.db" "$DB_OUT" && log "警告：无 sqlite3 / python 可备份，退回 cp"
+    fi
+    # 兜底校验：python 复制失败时可能留下空文件，宁可让整次备份失败也别发残缺包
+    if [ ! -s "$DB_OUT" ]; then
+        log "错误：app.db 备份结果为空，放弃打包"
+        exit 1
     fi
 fi
 
-# 2) 组装待打包目录（保持 data/ 前缀，和系统识别规则一致）
-mkdir -p "$TMP_DIR/data"
+# 2) 归档正式表与用户配置
 [ -d "$DATA_DIR/official" ] && cp -a "$DATA_DIR/official" "$TMP_DIR/data/official"
 [ -f "$DATA_DIR/users.json" ] && cp -a "$DATA_DIR/users.json" "$TMP_DIR/data/users.json"
 
