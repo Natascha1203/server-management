@@ -1696,20 +1696,25 @@ def review_rack_request(request_id):
 # 上架/变更时占用已有机位（原占用者自动下架）。
 # 管理人员：全部记录，可查看 / 手动登记 / 修改信息 / 重新上架 / 永久删除。
 # 机房人员：只看本机房，可查看、修改信息与重新上架；手动登记与永久删除仍归管理人员。
+# 业务人员：只读本单位（按快照的「归属单位」过滤），不能改信息、重新上架、手动登记或永久删除。
 # 「修改信息」只更新回收站里的快照，不上架；「重新上架」才写回服务器表并整行校验。
 
 @bp.get("/api/trash")
 @require_login
 def trash_api():
     user = current_user()
-    if "view_trash" not in capabilities_for(user):
+    caps = capabilities_for(user)
+    if "view_trash" not in caps:
         return forbidden()
     room = user["所属机房"] if user["身份"] == ROLE_ROOM else ""
+    business_unit = user["业务单位"] if user["身份"] == ROLE_BUSINESS else ""
     return jsonify(
-        items=[services.trash_to_json(row) for row in services.trash_rows(room)],
+        items=[services.trash_to_json(row) for row in services.trash_rows(room, business_unit)],
         # 快照存的是服务器整行，字段清单由后端下发，前端不再自己维护一份
         headers=ENTITIES["servers"]["headers"],
-        can_manage="manage_settings" in capabilities_for(user),
+        can_manage="manage_settings" in caps,
+        # 改信息 / 重新上架：管理人员与机房人员可以，业务人员只读
+        can_edit="manage_trash" in caps,
     )
 
 
@@ -1743,7 +1748,7 @@ def update_trash_api(trash_id):
     所以这里只挡序列号为空 / 与服务器表或回收站其它记录重复。
     """
     user = current_user()
-    if "view_trash" not in capabilities_for(user):
+    if "manage_trash" not in capabilities_for(user):
         return forbidden()
     room_scope = user["所属机房"] if user["身份"] == ROLE_ROOM else ""
     if room_scope and services.trash_entry(trash_id, room=room_scope) is None:
@@ -1763,7 +1768,7 @@ def update_trash_api(trash_id):
 @require_login
 def restore_trash_api(trash_id):
     user = current_user()
-    if "view_trash" not in capabilities_for(user):
+    if "manage_trash" not in capabilities_for(user):
         return forbidden()
     if user["身份"] == ROLE_ROOM:
         # 机房人员只能恢复本机房的记录

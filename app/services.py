@@ -1860,10 +1860,11 @@ def snapshot_deleted_server(deleted, change_id="", deleted_by="", reason=TRASH_R
         return move_server_to_trash(own, deleted, request_id=change_id, deleted_by=deleted_by, reason=reason)
 
 
-def trash_rows(room=""):
-    """回收站记录。room 非空时只返回该机房的 —— 机房人员只看本机房。
+def trash_rows(room="", business_unit=""):
+    """回收站记录。room 非空时只返回该机房的（机房人员只看本机房）；
+    business_unit 非空时只返回该归属单位的（业务人员只读本单位）。
 
-    手动登记的占位记录没有「所在机房」，只对管理人员可见（也只能由管理人员登记）。
+    手动登记的占位记录既没有「所在机房」也没有「归属单位」，只对管理人员可见。
     """
     with db() as conn:
         rows = conn.execute("SELECT * FROM trash ORDER BY deleted_at DESC, rowid DESC").fetchall()
@@ -1874,17 +1875,25 @@ def trash_rows(room=""):
             item for item in items
             if clean_value(parse_json_dict(item.get("data")).get("所在机房")) == target
         ]
+    if business_unit:
+        target = clean_value(business_unit)
+        items = [
+            item for item in items
+            if clean_value(parse_json_dict(item.get("data")).get("归属单位")) == target
+        ]
     return items
 
 
-def trash_entry(trash_id, room=""):
-    """取单条回收站记录（含快照字段）；room 非空时校验归属机房，不匹配返回 None。"""
+def trash_entry(trash_id, room="", business_unit=""):
+    """取单条回收站记录（含快照字段）；room / business_unit 非空时校验归属，不匹配返回 None。"""
     with db() as conn:
         row = conn.execute("SELECT * FROM trash WHERE id=?", (trash_id,)).fetchone()
     if not row:
         return None
     item = trash_to_json(row)
     if room and clean_value(item.get("所在机房")) != clean_value(room):
+        return None
+    if business_unit and clean_value(item.get("归属单位")) != clean_value(business_unit):
         return None
     return item
 

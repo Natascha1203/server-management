@@ -676,6 +676,70 @@ class TestRoomUserTrashAccess:
         assert client.post(f"/api/trash/{other['id']}/restore", json={}).status_code == 403
 
     def test_business_user_has_no_trash(self, app_env, admin, biz_user):
+        # 该用例已被需求 1 取代：业务人员可读回收站（本单位）。保留方法名仅为兼容，
+        # 断言改为「空回收站时能正常读取、且不能做任何写操作」。
         client = setup_base(app_env)
         login(client, "biz1")
-        assert client.get("/api/trash").status_code == 403
+        resp = client.get("/api/trash")
+        assert resp.status_code == 200
+        assert resp.get_json()["can_edit"] is False
+        assert resp.get_json()["can_manage"] is False
+
+
+class TestBusinessUserTrashAccess:
+    """业务人员只读回收站：只看归属单位=本单位，不能改信息 / 重新上架 / 登记 / 删除。"""
+
+    def _seed(self):
+        """铺两台服务器各进回收站：单位A（本单位）和单位B（外单位）。"""
+        add_official("cabinets", {"机房": "机房B", "机柜": "C1", "机位": "1-10"})
+        for serial, unit in (("SRV-UA", "单位A"), ("SRV-UB", "单位B")):
+            add_official("servers", {
+                "序列号": serial, "客户id": "1", "归属单位": unit,
+                "所在机房": "机房A", "所属机柜": "C1", "所属机位": "1-2",
+                "管理ip": "10.1.1.15/24", "带外ip": "10.1.3.15/24",
+            })
+            server = services.find_record("servers", serial)
+            with storage.db() as conn:
+                services.move_server_to_trash(conn, server, reason="测试", deleted_by="admin")
+            storage.write_records(
+                "servers", [r for r in storage.read_records("servers") if r["序列号"] != serial]
+            )
+
+    def test_business_sees_only_own_unit(self, app_env, admin, biz_user):
+        self._seed()
+        client = app_env["app"].test_client()
+        login(client, "biz1")
+        resp = client.get("/api/trash")
+        assert resp.status_code == 200
+        body = resp.get_json()
+        assert {item["serial_number"] for item in body["items"]} == {"SRV-UA"}
+        assert body["can_edit"] is False
+        assert body["can_manage"] is False
+
+    def test_admin_sees_all_units(self, app_env, admin, biz_user):
+        self._seed()
+        client = setup_base(app_env)
+        login(client)
+        body = client.get("/api/trash").get_json()
+        serials = {item["serial_number"] for item in body["items"]}
+        assert {"SRV-UA", "SRV-UB"}.issubset(serials)
+        assert body["can_edit"] is True
+
+    def test_business_cannot_mutate_trash(self, app_env, admin, biz_user):
+        self._seed()
+        admin_client = setup_base(app_env)
+        login(admin_client)
+        target = next(item for item in admin_client.get("/api/trash").get_json()["items"]
+                      if item["serial_number"] == "SRV-UA")
+
+        client = app_env["app"].test_client()
+        login(client, "biz1")
+        # 改信息 / 重新上架：即使知道自己单位的记录 id 也必须被挡
+        assert client.patch(f"/api/trash/{target['id']}", json={"server_data": {"品牌": "X"}}).status_code == 403
+        assert client.post(f"/api/trash/{target['id']}/restore", json={}).status_code == 403
+        # 手动登记与永久删除本来就是管理人员专属
+        assert client.post("/api/trash", json={"序列号": "SRV-NEW"}).status_code == 403
+        assert client.delete(f"/api/trash/{target['id']}").status_code == 403
+        # 记录未被改动，也没有被上架
+        assert services.trash_entry(target["id"])["品牌"] != "X"
+        assert "SRV-UA" not in {row["序列号"] for row in storage.read_records("servers")}

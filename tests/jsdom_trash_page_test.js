@@ -58,7 +58,11 @@ function fakeFetch(url, opt = {}) {
       json: () => Promise.resolve({ message: '序列号 SN-NEW 已加入回收站，重新上架时再补齐信息', id: 't-new' }),
     });
   }
-  if (String(url) === '/api/trash') return Promise.resolve({ ok: true, json: () => Promise.resolve({ items: TRASH_ITEMS }) });
+  if (String(url) === '/api/trash') return Promise.resolve({
+    ok: true,
+    // 不给 headers：前端回退到 SERVER_APPROVAL_HEADERS（服务器全部字段），与原测试预期一致
+    json: () => Promise.resolve({ items: TRASH_ITEMS, can_manage: true, can_edit: true }),
+  });
   if (String(url).startsWith('/api/changes')) return Promise.resolve({ ok: true, json: () => Promise.resolve({ changes: [] }) });
   if (String(url).startsWith('/api/rack-requests')) return Promise.resolve({ ok: true, json: () => Promise.resolve({ requests: [] }) });
   return Promise.resolve({ ok: true, json: () => Promise.resolve({}) });
@@ -178,6 +182,52 @@ async function main() {
   check('T6 重新上架调用 restore 接口', !!restoreReq, restoreReq?.url);
   const sent = restoreReq ? JSON.parse(restoreReq.body).server_data : {};
   check('T6 请求体带改后的品牌', sent['品牌'] === 'Lenovo', sent['品牌']);
+
+  // ===== T7: 按属性筛选（字段下拉 + 子串，多条件「与」）=====
+  check('T7 有筛选面板', !!$('#trashSearchPanel') && !!$('#trashFilterRows'));
+  check('T7 默认渲染一行筛选条件', $$('#trashFilterRows .trash-filter-row').length === 1,
+    String($$('#trashFilterRows .trash-filter-row').length));
+  // 初始一行「序列号」+ 关键词 SN-DOWN → 只命中一条
+  let row = $('#trashFilterRows .trash-filter-row');
+  row.querySelector('[data-combo]').dataset.value = '序列号';
+  row.querySelector('[data-pattern]').value = 'SN-DOWN';
+  $('#applyTrashFilterBtn').onclick();
+  await tick();
+  check('T7 序列号子串筛选命中 1 条', $$('#trashList .review-card').length === 1,
+    String($$('#trashList .review-card').length));
+  check('T7 命中正确的记录', $('#trashList').textContent.includes('SN-DOWN'));
+
+  // 加第二行「所在机房 = 机房Z」→ 与条件冲突，0 条
+  $('#addTrashFilterBtn').onclick();
+  await tick();
+  check('T7 添加条件后有两行', $$('#trashFilterRows .trash-filter-row').length === 2,
+    String($$('#trashFilterRows .trash-filter-row').length));
+  row = $$('#trashFilterRows .trash-filter-row')[1];
+  row.querySelector('[data-combo]').dataset.value = '所在机房';
+  row.querySelector('[data-pattern]').value = '机房Z';
+  $('#applyTrashFilterBtn').onclick();
+  await tick();
+  check('T7 多条件与冲突时 0 条', $$('#trashList .review-card').length === 0,
+    String($$('#trashList .review-card').length));
+  check('T7 空结果显示提示文案', $('#trashList').textContent.includes('没有服务器'));
+
+  // 清空 → 恢复全部 2 条
+  $('#clearTrashFilterBtn').onclick();
+  await tick();
+  check('T7 清空后恢复全部记录', $$('#trashList .review-card').length === 2,
+    String($$('#trashList .review-card').length));
+  check('T7 清空后回到一行空条件', $$('#trashFilterRows .trash-filter-row').length === 1);
+
+  // 删除元信息筛选：删除人 = admin → 两条都命中
+  row = $('#trashFilterRows .trash-filter-row');
+  row.querySelector('[data-combo]').dataset.value = '删除人';
+  row.querySelector('[data-pattern]').value = 'admin';
+  $('#applyTrashFilterBtn').onclick();
+  await tick();
+  check('T7 删除人元信息字段可筛选', $$('#trashList .review-card').length === 2,
+    String($$('#trashList .review-card').length));
+  $('#clearTrashFilterBtn').onclick();
+  await tick();
 
   console.log('RESULT: ' + passed + ' passed, ' + failures.length + ' failed');
   if (failures.length) {

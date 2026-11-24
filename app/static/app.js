@@ -2,7 +2,9 @@ const APP_CAPABILITIES = window.APP_CAPABILITIES || [];
 const APP_USER = window.APP_USER || {};
 const SERVER_APPROVAL_HEADERS = ['序列号', '品牌', '型号', 'CPU型号', '网卡', '服务器成本(万)', '归属单位', '用途分类', '用途', '防火墙白名单', '资源申请编号', '是否液冷', '客户id', '客户名称', '所在机房', '所属机柜', '所属机位', '管理ip', '交易ip', '带外ip', '管理密码', '带外密码', '上架时间', '接入行情', '接入柜台', '备注'];
 const RACK_REVIEW_FILTER_FIELDS = ['序列号', '客户id', '客户名称', '所在机房'];
-const state = { entity: 'cabinets', records: [], meta: null, editing: null, pendingEditing: null, rackEditing: null, rackRequestStatus: 'pending', status: 'pending', reviewMode: 'allocation', stats: null, filters: [], sorts: [], reviewFilters: [], rackRequestFilters: [], changes: [], rackRequests: [], rackApprovalOptions: { rooms: [] }, rackSlotPick: {}, rackRequestExpanded: [], rackReviewExpanded: [], systemUsers: [], customerOptions: [], fieldOptions: {}, fieldOptionsAdmin: null, attachmentMap: {}, attachmentCounts: {}, attachmentModalSerial: '', trash: [], trashExpanded: [], snapshots: [] };
+// 回收站快照的筛选字段 = 服务器表全部列 + 删除元信息；与正式表/上下架请求一样按字段多选、条件「与」匹配
+const TRASH_EXTRA_FILTER_FIELDS = ['删除原因', '删除人', '删除时间'];
+const state = { entity: 'cabinets', records: [], meta: null, editing: null, pendingEditing: null, rackEditing: null, rackRequestStatus: 'pending', status: 'pending', reviewMode: 'allocation', stats: null, filters: [], sorts: [], reviewFilters: [], rackRequestFilters: [], changes: [], rackRequests: [], rackApprovalOptions: { rooms: [] }, rackSlotPick: {}, rackRequestExpanded: [], rackReviewExpanded: [], systemUsers: [], customerOptions: [], fieldOptions: {}, fieldOptionsAdmin: null, attachmentMap: {}, attachmentCounts: {}, attachmentModalSerial: '', trash: [], trashFilters: [], trashExpanded: [], trashCanManage: true, trashCanEdit: true, snapshots: [] };
 const $ = s => document.querySelector(s);
 const $$ = s => [...document.querySelectorAll(s)];
 
@@ -2113,7 +2115,48 @@ async function reviewRackRequest(id, action) {
    「保存修改」只更新回收站里的这条记录（不上架、不做完整校验），
    「重新上架」才写回服务器表，并按机柜表校验客户 / 机位 / IP 占用。
    管理人员：全部记录，可手动登记（origin=manual）、改信息、重新上架、永久删除。
-   机房人员：只看本机房，可改信息与重新上架；永久删除与手动登记仍归管理人员。 */
+   机房人员：只看本机房，可改信息与重新上架；永久删除与手动登记仍归管理人员。
+   业务人员：只读本单位（归属单位）的记录，不能改信息 / 重新上架 / 登记 / 删除。 */
+
+// 回收站筛选字段：服务器整行字段（后端下发的 headers）+ 删除元信息，条件之间「与」
+function trashFilterFields() {
+  return [...trashHeaders(), ...TRASH_EXTRA_FILTER_FIELDS];
+}
+
+function renderTrashFilters() {
+  const container = $('#trashFilterRows');
+  if (!container) return;
+  const rows = state.trashFilters.length ? state.trashFilters : [{ field: trashFilterFields()[0], pattern: '' }];
+  container.innerHTML = rows.map((filter, index) => `<div class="filter-row trash-filter-row" data-index="${index}">${fieldComboHtml(filter.field, trashFilterFields())}<input data-pattern value="${esc(filter.pattern || '')}" placeholder="输入筛选内容"><button class="mini delete" type="button" onclick="removeTrashFilter(${index})">删除</button></div>`).join('');
+}
+
+function collectTrashFilters() {
+  return $$('#trashFilterRows .trash-filter-row').map(row => {
+    const field = comboValue(row.querySelector('[data-combo]'));
+    const pattern = row.querySelector('[data-pattern]')?.value.trim() || '';
+    return { field, pattern };
+  }).filter(item => item.field && item.pattern);
+}
+
+function trashSearchValue(item, field) {
+  const aliases = { '删除原因': 'reason', '删除人': 'deleted_by', '删除时间': 'deleted_at' };
+  const key = aliases[field] || field;
+  return String(item[key] ?? '');
+}
+
+function filteredTrash() {
+  const filters = collectTrashFilters();
+  state.trashFilters = filters;
+  if (!filters.length) return state.trash;
+  return state.trash.filter(item => filters.every(f => trashSearchValue(item, f.field).includes(f.pattern)));
+}
+
+window.removeTrashFilter = index => {
+  state.trashFilters = collectTrashFilters();
+  state.trashFilters.splice(index, 1);
+  renderTrashFilters();
+  renderTrash();
+};
 
 // 这些字段给个填写样例，避免手填格式错（后端仍按服务器表规则校验）
 const TRASH_FIELD_HINTS = {
@@ -2153,14 +2196,32 @@ function canPurgeTrash() {
   return state.trashCanManage !== false && isAdmin();
 }
 
+function canEditTrash() {
+  return state.trashCanEdit !== false;
+}
+
 function trashCard(item) {
   const serial = item.serial_number || item['序列号'] || '';
   const customer = item['客户名称'] || item['客户id'] || '';
   const location = [item['所在机房'], item['所属机柜'], item['所属机位']].filter(Boolean).join(' / ');
   const manual = item.origin === 'manual';
   const expanded = state.trashExpanded.includes(item.id);
-  const inputs = trashHeaders().map(field => trashFieldInput(field, item)).join('');
   const head = `<div class="review-top rack-request-head" data-trash-expand-id="${esc(item.id)}" title="点击展开/收起">${manual ? '<span class="tag">手动登记</span>' : ''}<strong>${esc(serial)}</strong><span class="muted">${esc(location || '未记录位置')}</span>${customer ? `<span class="muted">· ${esc(customer)}</span>` : ''}<span class="review-time">${esc(item.deleted_at || '')}${item.deleted_by ? ' · ' + esc(item.deleted_by) : ''}</span><span class="rack-caret">${expanded ? '▾' : '▸'}</span></div>`;
+
+  // 只读视图（业务人员）：只展示整行快照，没有可编辑表单和任何操作按钮
+  if (!canEditTrash()) {
+    const readonly = manual
+      ? '<div class="diff compact"><div class="diff-box"><b>手动登记</b><p class="muted">这条记录信息尚未补齐。</p></div></div>'
+      : `<div class="diff compact"><div class="diff-box">${trashDetails(item)}</div></div>`;
+    const body = `<div class="rack-request-body"${expanded ? '' : ' hidden'}>
+      ${readonly}
+      ${item.reason ? `<p class="muted">来源：${esc(item.reason)}</p>` : ''}
+      <p class="muted">当前账号对回收站为只读权限，如需修改或重新上架请联系管理人员或机房人员。</p>
+    </div>`;
+    return `<article class="review-card rack-request-card">${head}${body}</article>`;
+  }
+
+  const inputs = trashHeaders().map(field => trashFieldInput(field, item)).join('');
   const recordBlock = manual
     ? '<div class="diff compact"><div class="diff-box"><b>手动登记</b><p class="muted">这条记录只有序列号，补齐下面任意字段后可以先「保存修改」，也可以直接「重新上架」。</p></div></div>'
     : `<details class="diff compact"><summary><b>删除时记录（只读）</b></summary><div class="diff-box">${trashDetails(item)}</div></details>`;
@@ -2189,7 +2250,8 @@ function trashCard(item) {
 function renderTrash() {
   const box = $('#trashList');
   if (!box) return;
-  box.innerHTML = state.trash.length ? state.trash.map(trashCard).join('') : '<div class="card empty">回收站里没有服务器</div>';
+  const rows = filteredTrash();
+  box.innerHTML = rows.length ? rows.map(trashCard).join('') : '<div class="card empty">回收站里没有服务器</div>';
   bindTrashActions();
   refreshTrashBadge();
 }
@@ -2267,9 +2329,11 @@ async function loadTrash() {
     state.trash = d.items || [];
     state.trashHeaders = d.headers || [];
     state.trashCanManage = d.can_manage !== false;
-    // 手动登记只有管理人员能做，机房人员看到表单只会 403
+    state.trashCanEdit = d.can_edit !== false;
+    // 手动登记只有管理人员能做，机房人员/业务人员看到表单只会 403
     const addForm = $('#trashAddForm');
     if (addForm) addForm.hidden = !canPurgeTrash();
+    renderTrashFilters();
     renderTrash();
   } catch (e) {
     toast(e.message, true);
@@ -3378,6 +3442,17 @@ function bindStatsFilters() {
 }
 
 bindStatsFilters();
+if ($('#addTrashFilterBtn')) $('#addTrashFilterBtn').onclick = () => {
+  state.trashFilters = collectTrashFilters();
+  state.trashFilters.push({ field: trashFilterFields()[0], pattern: '' });
+  renderTrashFilters();
+};
+if ($('#applyTrashFilterBtn')) $('#applyTrashFilterBtn').onclick = () => renderTrash();
+if ($('#clearTrashFilterBtn')) $('#clearTrashFilterBtn').onclick = () => {
+  state.trashFilters = [];
+  renderTrashFilters();
+  renderTrash();
+};
 bindFieldCombos();
 bindTagFields();
 loadFieldOptions();

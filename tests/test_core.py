@@ -71,7 +71,11 @@ class TestPermissions:
         assert "review_operations" in capabilities_for(ADMIN)
         assert "review_operations" not in capabilities_for(ROOM)
         assert "review_rack_requests" in capabilities_for(ROOM)
-        assert capabilities_for(BIZ) == ["submit_rack_request"]
+        # 业务人员只读回收站：有 view_trash，但没有改信息/重新上架的 manage_trash
+        assert capabilities_for(BIZ) == ["submit_rack_request", "view_trash"]
+        assert "manage_trash" in capabilities_for(ADMIN)
+        assert "manage_trash" in capabilities_for(ROOM)
+        assert "manage_trash" not in capabilities_for(BIZ)
 
     def test_view_entity(self):
         for entity in ("customers", "cabinets", "servers"):

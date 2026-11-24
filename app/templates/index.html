@@ -161,11 +161,17 @@
     </section>
 
     <section id="trash" class="page">
-      <div class="hero"><div><h2>回收站</h2><p>下架、删除或被新服务器占用机位的服务器整行暂存在这里，保存的是服务器表当时的全部信息。可以修改客户 / 机位后重新上架；管理人员还可以永久删除，或手动登记只有序列号的服务器。</p></div><div class="hero-note"><b>机房人员只看本机房</b><span>永久删除与手动登记仅限管理人员</span></div></div>
+      <div class="hero"><div><h2>回收站</h2><p>下架、删除或被新服务器占用机位的服务器整行暂存在这里，保存的是服务器表当时的全部信息。管理人员与机房人员可以修改客户 / 机位后重新上架；管理人员还可以永久删除，或手动登记只有序列号的服务器。业务人员可只读查看本单位服务器。</p></div><div class="hero-note"><b>机房人员只看本机房 · 业务人员只读本单位</b><span>永久删除与手动登记仅限管理人员</span></div></div>
       <form id="trashAddForm" class="card form-grid trash-add-form" autocomplete="off" hidden>
         <label>序列号<input id="trashAddSerial" name="序列号" placeholder="必填，其他信息可在重新上架时再补"></label>
         <div class="review-actions wide"><button class="btn primary" type="submit">手动加入回收站</button></div>
       </form>
+      <div id="trashSearchPanel" class="review-search card">
+        <div id="trashFilterRows" class="filter-rows"></div>
+        <button id="addTrashFilterBtn" class="btn ghost" type="button">＋ 添加条件</button>
+        <button id="applyTrashFilterBtn" class="btn primary" type="button">⌕ 查询</button>
+        <button id="clearTrashFilterBtn" class="btn ghost" type="button">清空</button>
+      </div>
       <div class="table-meta no-border"><b>回收站中的服务器</b><span id="trashListHint">重新上架前会按机柜表校验客户、机位与 IP 占用；冲突时请先补登客户或腾出机位</span></div>
       <div id="trashList" class="review-list"></div>
     </section>

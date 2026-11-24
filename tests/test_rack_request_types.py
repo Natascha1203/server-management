@@ -531,11 +531,13 @@ class TestTrashApi:
         assert client.post(f"/api/rack-requests/{request_id}/review", json={"action": "approve"}).status_code == 200
         return trash_items()[0]["id"]
 
-    def test_only_admin_can_read(self, app_env, admin):
+    def test_business_reads_but_cannot_mutate(self, app_env, admin):
         base_setup()
         client = app_env["app"].test_client()
         login(client, "biz1")
-        assert client.get("/api/trash").status_code == 403
+        resp = client.get("/api/trash")
+        assert resp.status_code == 200
+        assert resp.get_json()["can_edit"] is False
         assert client.delete("/api/trash/whatever").status_code == 403
         assert client.post("/api/trash/whatever/restore", json={}).status_code == 403
 
