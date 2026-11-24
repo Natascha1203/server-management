@@ -45,7 +45,7 @@
 2. 粘入下面「通用片段」，把两个占位符换成上表的值，保存
 3. 回到连接器列表，对 `server-management` 点**信任**
 4. 新开一个会话，说「列出 server-management 下所有可用的工具」，出现一批 `sm_*` 就通了
-   （管理人员 token 是 13 个；业务/机房人员会少几个，见文末「连不上时」）
+   （管理人员 token 是 14 个；业务/机房人员会少几个，见文末「连不上时」）
 
 ## 2. CodeBuddy
 
@@ -105,6 +105,7 @@ token 都对上了。接着让它 bootstrap 一次，拿到实时字段清单、
 | 看某柜占用 | 「王港机房 D10 现在占了哪些机位」 | `sm_query(entity="cabinets", filters={"机房":"王港机房","机柜":"D10"})` |
 | 看还剩多少位置 | 「各机房的机位空余统计」 | `sm_stats` |
 | 改某个字段 | 「把 2026621SH8703 的 CPU 改成 X」 | `sm_upsert(entity="servers", old_key="2026621SH8703", row={"CPU型号":"X"})` |
+| 批量导入 | 「把这个表里的 20 台服务器导进去」 | `sm_import_json(entity="servers", rows=[{真实表头:值}, ...], mode="full"/"merge")` |
 | 走上下架 | 「这台上架，客户 00000001，D10 18-19」 | `sm_rack_submit` |
 | 处理待审批 | 「列出待审批的变更」 | `sm_pending`（仅管理人员可见） |
 
@@ -115,6 +116,9 @@ token 都对上了。接着让它 bootstrap 一次，拿到实时字段清单、
   管理人员 token 的写操作直接生效。
 - **改记录只说改哪一项**。`sm_upsert` 给 `old_key` + 要改的字段即可，工具会取回原记录合并，
   不需要回传整行。
+- **批量导入用 `sm_import_json`**：先把 Excel/CSV 解析成 `[{真实表头: 值}, ...]` 再传，
+  语义与页面「导入」一致（校验 + 审批流 + 写前备份），无需上传文件。字段名以 `sm_schema` 为准；
+  `mode=full` 未提供的列置空，`mode=merge` 保留旧值；单次最多 2000 行。
 - **删除要二次确认**：`sm_delete` 必须同时给 `keys` 和内容完全一致的 `confirm_keys`，
   否则一条都不删。这是防手滑的硬校验，模型绕不过去。删之前先 `sm_query` 确认是这几条。
 - **被 403 拒了不要重试**，先 `sm_whoami` 看身份。工具列表本身也按身份裁剪：业务/机房人员
@@ -235,4 +239,4 @@ printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' \
   | SM_BASE_URL=<后端地址> SM_TOKEN=<token> python run_server.py
 ```
 
-正常输出一行 JSON，里面是全部工具名（管理人员 token 为 13 个）。
+正常输出一行 JSON，里面是全部工具名（管理人员 token 为 14 个）。

@@ -193,6 +193,37 @@ TOOL_SPECS = [
         "annotations": {"readOnlyHint": False, "destructiveHint": False},
     },
     {
+        "name": "sm_import_json",
+        "description": (
+            "批量导入：一次提交多条记录，语义与页面「导入」完全一致（校验 → 审批流 → 写库），"
+            "无需 multipart 文件——适合「先解析 Excel/CSV 成 JSON 数组再提交」的场景。"
+            "rows 的键用真实表头（先调 sm_schema 确认），未提供的列按 mode 处理："
+            "full=置空、merge=保留旧值。单行就够时用 sm_upsert 即可。"
+            "返回 imported/added/updated/change_ids 与 applied/pending："
+            "管理人员直接生效，其他身份逐条进待审批。导入前服务端自动备份一份（返回 auto_backup）。\n"
+            "注意：导入不做机位占用（takeover）；目标机位被占的行会校验失败，需单独用 sm_upsert(takeover=true) 处理。"
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "entity": {"type": "string", "description": ENTITY_HELP},
+                "rows": {
+                    "type": "array",
+                    "description": '记录数组，每项为 {真实表头: 值}，最多 2000 条；例如 [{"序列号": "A01", "客户id": "00000001"}]',
+                    "items": {"type": "object"},
+                },
+                "mode": {
+                    "type": "string",
+                    "enum": ["full", "merge"],
+                    "description": "full=未提供列置空（默认）；merge=未提供列保留旧值",
+                },
+            },
+            "required": ["entity", "rows"],
+            "additionalProperties": False,
+        },
+        "annotations": {"readOnlyHint": False, "destructiveHint": False},
+    },
+    {
         "name": "sm_delete",
         "description": (
             "删除记录。**servers 删除会整行进回收站（可恢复）；cabinets / customers 删除不可撤销**。"
@@ -811,6 +842,71 @@ def _upsert(client, args):
     return _idempotent("sm_upsert", args, run)
 
 
+MAX_IMPORT_ROWS = 2000
+
+
+def _import_json(client, args):
+    """批量导入：解析后的 JSON 数组直接提交，后端复用页面导入的校验与审批流。"""
+    entity = _require_entity(args.get("entity"))
+    rows = args.get("rows")
+    if not isinstance(rows, list):
+        raise SMError("rows 必须是数组：[{字段名: 值}, ...]")
+    if not rows:
+        raise SMError("rows 不能为空")
+    if len(rows) > MAX_IMPORT_ROWS:
+        raise SMError("单次最多导入 %d 行，请分批提交" % MAX_IMPORT_ROWS)
+    mode = str(args.get("mode") or "full").strip()
+    if mode not in ("full", "merge"):
+        raise SMError("mode 只能是 full 或 merge")
+
+    # 用表头做一次字段名校验：命不中的字段直接报出来，避免后端整批 400 时看不出是哪列写错
+    headers, _, _ = _load_entity(client, entity)
+    for idx, row in enumerate(rows, 1):
+        if not isinstance(row, dict) or not row:
+            raise SMError("第 %d 行不是非空对象" % idx)
+        unknown = [k for k in row if _resolve_field(headers, k) is None]
+        if unknown:
+            raise SMError(
+                "第 %d 行有未知字段：%s。先调 sm_schema(entity=%s) 确认表头，不要猜列名。"
+                % (idx, "、".join(str(k) for k in unknown), entity)
+            )
+
+    def run():
+        result = client.json(
+            "/api/%s/import-json" % entity,
+            method="POST",
+            payload={"rows": rows, "mode": mode},
+        )
+        imported = int(result.get("imported") or 0)
+        added = int(result.get("added") or 0)
+        updated = int(result.get("updated") or 0)
+        ids = result.get("change_ids") or []
+        message = str(result.get("message") or "")
+        applied = imported > 0 and "直接生效" in message
+        pending = bool(ids) and not applied
+        return _dumps({
+            "operation": "批量导入",
+            "entity": entity,
+            "imported": imported,
+            "added": added,
+            "updated": updated,
+            "applied": applied,
+            "pending": pending,
+            "change_ids": ids,
+            "message": message,
+            "next": (
+                "已生效，可用 sm_query 复核。"
+                if applied
+                else ("尚未生效：这是待审批申请，需管理人员调 sm_review 批准后落库。" if pending
+                      else "本次没有可导入的数据，检查 rows 是否为空行。")
+            ),
+            **_auto_backup_note(client),
+        })
+
+    # 导入是新增类操作，同样纳入幂等窗口，防止 agent 看不懂返回时原样重试造成重复导入
+    return _idempotent("sm_import_json", args, run)
+
+
 def _delete(client, args):
     entity = _require_entity(args.get("entity"))
     keys = args.get("keys")
@@ -1033,6 +1129,7 @@ HANDLERS = {
     "sm_rack_list": _rack_list,
     "sm_rack_get": _rack_get,
     "sm_upsert": _upsert,
+    "sm_import_json": _import_json,
     "sm_delete": _delete,
     "sm_pending": _pending,
     "sm_review": _review,

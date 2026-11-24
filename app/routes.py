@@ -631,32 +631,15 @@ def add_entity(entity):
     return jsonify(message=message, change_id=change_id)
 
 
-@bp.post("/api/<entity>/import")
-@require_login
-def import_entity(entity):
-    denied = ensure_entity_mutate_response(entity)
-    if denied:
-        return denied
-    entity = normalize_entity(entity)
-    meta = ENTITIES[entity]
-    uploaded = request.files.get("file")
-    # 覆盖模式：full=全量覆盖（默认，未提供列置空）；merge=增量覆盖（未提供列保留旧值）
-    mode = clean_value(request.form.get("mode") or request.args.get("mode") or "full")
-    if mode not in ("full", "merge"):
-        return jsonify(error="覆盖模式仅支持 full 或 merge"), 400
-    try:
-        source_label, values = storage.uploaded_table_rows(uploaded, meta) if uploaded else (None, None)
-    except UnicodeDecodeError:
-        return jsonify(error="CSV 文件必须使用 UTF-8 编码"), 400
-    except ValueError as exc:
-        return jsonify(error=str(exc)), 400
-    if values is None:
-        return jsonify(error="请选择 .xlsx 或 .csv 文件"), 400
-    if not values:
-        return jsonify(error=f"{source_label} 没有数据"), 400
+def _import_rows(entity, headers, values_rows, mode, source_label="导入数据"):
+    """导入的核心：校验 → 合并 → 落库。被文件 /import 与 JSON /import-json 共用。
+
+    headers: 表头列表；values_rows: 数据行（二维，每行与 headers 等长）。
+    source_label 只用于错误提示。返回 (响应, 状态码) 供路由直接返回。
+    """
     from .core import normalize_row, record_key
 
-    headers = [clean_value(x) for x in values[0]]
+    meta = ENTITIES[entity]
     missing = [h for h in meta["headers"] if h not in headers]
     if missing:
         return jsonify(error="缺少列：" + "、".join(missing)), 400
@@ -665,7 +648,7 @@ def import_entity(entity):
     existing_by_key = {record_key(meta, x): x for x in existing}
     accepted, row_errors = [], []
     file_seen = set()
-    for line_no, values_row in enumerate(values[1:], 2):
+    for line_no, values_row in enumerate(values_rows, 2):
         raw = {h: v for h, v in zip(headers, values_row)}
         if not any(clean_value(v) for v in raw.values()):
             continue
@@ -705,7 +688,71 @@ def import_entity(entity):
     if update_count:
         parts.append(f"{update_count} 条修改" if direct else f"{update_count} 条修改申请")
     message = ("已导入并直接生效：" if direct else "已提交 ") + "，".join(parts)
-    return jsonify(message=message, change_ids=ids)
+    if not accepted:
+        message = "没有可导入的数据（所有行均为空或已跳过）"
+    return jsonify(message=message, change_ids=ids, imported=len(accepted), added=add_count, updated=update_count), 200
+
+
+@bp.post("/api/<entity>/import")
+@require_login
+def import_entity(entity):
+    denied = ensure_entity_mutate_response(entity)
+    if denied:
+        return denied
+    entity = normalize_entity(entity)
+    meta = ENTITIES[entity]
+    uploaded = request.files.get("file")
+    # 覆盖模式：full=全量覆盖（默认，未提供列置空）；merge=增量覆盖（未提供列保留旧值）
+    mode = clean_value(request.form.get("mode") or request.args.get("mode") or "full")
+    if mode not in ("full", "merge"):
+        return jsonify(error="覆盖模式仅支持 full 或 merge"), 400
+    try:
+        source_label, values = storage.uploaded_table_rows(uploaded, meta) if uploaded else (None, None)
+    except UnicodeDecodeError:
+        return jsonify(error="CSV 文件必须使用 UTF-8 编码"), 400
+    except ValueError as exc:
+        return jsonify(error=str(exc)), 400
+    if values is None:
+        return jsonify(error="请选择 .xlsx 或 .csv 文件"), 400
+    if not values:
+        return jsonify(error=f"{source_label} 没有数据"), 400
+    headers = [clean_value(x) for x in values[0]]
+    return _import_rows(entity, headers, values[1:], mode, source_label)
+
+
+@bp.post("/api/<entity>/import-json")
+@require_login
+def import_entity_json(entity):
+    """JSON 数组导入：给「解析文件→转 JSON→上传」的 MCP/agent 链路用，无需 multipart。
+
+    body = {"rows": [{"字段名": 值}, ...], "mode": "full"|"merge"}。
+    校验、覆盖模式、审批流与文件 /import 完全一致（共用 _import_rows）。
+    rows 的键按实体表头精确匹配（忽略首尾空格），未提供的列留空。
+    """
+    denied = ensure_entity_mutate_response(entity)
+    if denied:
+        return denied
+    entity = normalize_entity(entity)
+    meta = ENTITIES[entity]
+    body = request.get_json(silent=True) or {}
+    rows = body.get("rows")
+    mode = clean_value(body.get("mode") or "full")
+    if mode not in ("full", "merge"):
+        return jsonify(error="覆盖模式仅支持 full 或 merge"), 400
+    if not isinstance(rows, list):
+        return jsonify(error="rows 必须是数组：[{字段名: 值}, ...]"), 400
+    MAX_IMPORT_JSON_ROWS = 2000
+    if len(rows) > MAX_IMPORT_JSON_ROWS:
+        return jsonify(error=f"单次最多导入 {MAX_IMPORT_JSON_ROWS} 行，请分批"), 400
+    headers = list(meta["headers"])
+    canonical = {clean_value(h): h for h in headers}
+    aligned = []
+    for item in rows:
+        if not isinstance(item, dict):
+            return jsonify(error="rows 的每一项必须是对象：{字段名: 值}"), 400
+        raw = {canonical.get(clean_value(k), clean_value(k)): v for k, v in item.items()}
+        aligned.append([raw.get(h, "") for h in headers])
+    return _import_rows(entity, headers, aligned, mode, "JSON 数据")
 
 
 @bp.post("/api/<entity>/update")

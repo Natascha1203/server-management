@@ -231,6 +231,79 @@ class TestUpsertTakeover:
         assert "takeover" not in client.posts_to("/api/cabinets/add")[0]["payload"]
 
 
+# ---------------------------------------------------------------- sm_import_json
+
+class TestImportJson:
+    """批量导入：字段校验在 client 侧先挡一道，返回语义与 upsert 一致。"""
+
+    IMPORT_OK = {
+        "message": "已导入并直接生效：2 条新增",
+        "change_ids": ["c1", "c2"],
+        "imported": 2, "added": 2, "updated": 0,
+    }
+
+    def test_import_posts_rows_and_mode(self):
+        client = stub(posts={"/api/servers/import-json": self.IMPORT_OK})
+        body = json.loads(mcp_tools.call_tool(
+            "sm_import_json",
+            {
+                "entity": "servers",
+                "rows": [
+                    {"序列号": "SN-9", "品牌": "Dell"},
+                    {"序列号": "SN-10", "品牌": "HP"},
+                ],
+                "mode": "merge",
+            },
+            client,
+        ))
+        payload = client.posts_to("/api/servers/import-json")[0]["payload"]
+        assert payload["rows"][0]["序列号"] == "SN-9"
+        assert payload["mode"] == "merge"
+        assert body["imported"] == 2 and body["added"] == 2
+        assert body["applied"] is True and body["pending"] is False
+
+    def test_import_pending_for_non_admin(self):
+        result = dict(self.IMPORT_OK, message="已提交 2 条新增申请")
+        client = stub(posts={"/api/servers/import-json": result})
+        body = json.loads(mcp_tools.call_tool(
+            "sm_import_json", {"entity": "servers", "rows": [{"序列号": "SN-9"}]}, client
+        ))
+        assert body["applied"] is False and body["pending"] is True
+        assert "sm_review" in body["next"]
+
+    def test_import_rejects_unknown_field(self):
+        """未知列名要在 client 侧就报出来，不要让后端整批 400 却看不出是哪列。"""
+        client = stub(posts={"/api/servers/import-json": self.IMPORT_OK})
+        from mcp_server.sm_mcp.client import SMError
+        with pytest.raises(SMError, match="未知字段"):
+            mcp_tools.call_tool(
+                "sm_import_json",
+                {"entity": "servers", "rows": [{"序列号": "SN-9", "不存在的列": "x"}]},
+                client,
+            )
+        assert not client.posts_to("/api/servers/import-json")
+
+    def test_import_rejects_empty_rows(self):
+        client = stub(posts={"/api/servers/import-json": self.IMPORT_OK})
+        with pytest.raises(SMError, match="不能为空"):
+            mcp_tools.call_tool("sm_import_json", {"entity": "servers", "rows": []}, client)
+
+    def test_import_default_mode_full(self):
+        client = stub(posts={"/api/servers/import-json": self.IMPORT_OK})
+        mcp_tools.call_tool(
+            "sm_import_json", {"entity": "servers", "rows": [{"序列号": "SN-9"}]}, client
+        )
+        assert client.posts_to("/api/servers/import-json")[0]["payload"]["mode"] == "full"
+
+    def test_import_idempotent(self):
+        client = stub(posts={"/api/servers/import-json": self.IMPORT_OK})
+        args = {"entity": "servers", "rows": [{"序列号": "SN-9"}]}
+        first = mcp_tools.call_tool("sm_import_json", args, client)
+        second = mcp_tools.call_tool("sm_import_json", args, client)
+        assert first == second
+        assert len(client.posts_to("/api/servers/import-json")) == 1
+
+
 # ---------------------------------------------------------------- sm_delete
 
 class TestDelete:

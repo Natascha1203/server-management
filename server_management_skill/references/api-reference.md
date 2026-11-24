@@ -85,6 +85,11 @@ Body: {"filters":[{"field":"序列号","pattern":"^SN-"}],
 - `mode=merge`：仅覆盖「提供了非空值的列」，空值列保留旧值。
 - **表头必须包含实体全部列**，否则 400「缺少列」。
 
+**批量导入（JSON）**：`POST /api/<entity>/import-json`，Body `{"rows":[{字段名:值},...], "mode":"full|merge"}`
+- 给「解析文件→转 JSON→提交」的链路用（MCP `sm_import_json` 走这条），无需 multipart。
+- rows 键按真实表头匹配（忽略首尾空格），未提供的列按 mode 处理；单次最多 2000 行。
+- 校验 / 覆盖语义 / 审批流与文件 `/import` 完全一致（共用 `_import_rows`），支持 agent 汇报的 `imported/added/updated/change_ids`。
+
 **下载模板**：`GET /api/<entity>/template?format=xlsx|csv`
 
 **导出**：`POST /api/<entity>/export?format=xlsx|csv`，Body 同 search 的 filters/sorts → 返回文件流
@@ -306,7 +311,7 @@ Token 不再需要手工写 `data/users.json`，也**不存在管理员代发**�
 - 备份失败 → 请求直接 500 中止，不会「没退路还照改」。
 - 轮转份数由设置 `auto_backup_keep` 控制（默认 20），与人工备份的 `backup_keep_count` 独立，
   互不挤占。
-- MCP 的写工具（`sm_upsert` / `sm_delete` / `sm_review` / `sm_rack_submit` / `sm_rack_review`）
+- MCP 的写工具（`sm_upsert` / `sm_import_json` / `sm_delete` / `sm_review` / `sm_rack_submit` / `sm_rack_review`）
   默认都带这个头，返回里的 `auto_backup` 就是本次改之前的快照名；设环境变量
   `SM_AUTO_BACKUP=0` 可关闭。
 
