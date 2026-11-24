@@ -135,6 +135,32 @@ async function main() {
   await tick();
   check('T5 复制拿到完整 token', copied === SECOND_TOKEN, copied);
 
+  // ===== T6: 明文 HTTP 下无 clipboard API，走 execCommand 兜底 =====
+  const realToast = dom.window.toast;
+  let fallbackCopied = '';
+  let toastMsg = '';
+  dom.window.navigator.clipboard = undefined;
+  dom.window.document.execCommand = cmd => {
+    if (cmd !== 'copy') return false;
+    const ta = dom.window.document.querySelector('textarea.sm-copy-buffer');
+    fallbackCopied = ta ? ta.value : '';
+    return true;
+  };
+  dom.window.toast = (msg, err) => { toastMsg = msg; };
+  await $('#tokenCopy').onclick();
+  dom.window.toast = realToast;
+  check('T6 无 clipboard API 时兜底复制完整 token', fallbackCopied === SECOND_TOKEN, fallbackCopied);
+  check('T6 成功时不再提示手动复制', !toastMsg.includes('手动'), toastMsg);
+  check('T6 临时 textarea 已清理', !dom.window.document.querySelector('textarea.sm-copy-buffer'));
+
+  // ===== T7: 两条路都失败才提示手动复制 =====
+  dom.window.navigator.clipboard = { writeText: () => Promise.reject(new Error('denied')) };
+  dom.window.document.execCommand = () => false;
+  dom.window.toast = (msg, err) => { toastMsg = msg; };
+  await $('#tokenCopy').onclick();
+  dom.window.toast = realToast;
+  check('T7 全部失败才提示手动复制', toastMsg.includes('手动'), toastMsg);
+
   console.log('RESULT: ' + passed + ' passed, ' + failures.length + ' failed');
   if (failures.length) {
     console.log(failures.map(f => '  FAIL ' + f).join('\n'));

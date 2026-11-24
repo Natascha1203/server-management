@@ -2752,13 +2752,46 @@ function renderSystemUsers() {
   $('#systemUsersBody').innerHTML = state.systemUsers.map((user, index) => `<tr data-index="${index}"><td><input name="用户id" value="${esc(user['用户id'] || '')}"></td><td><input name="密码" value="${esc(user['密码'] || '')}"></td><td><select name="身份">${['管理人员','机房人员','业务人员'].map(role => `<option${role === user['身份'] ? ' selected' : ''}>${role}</option>`).join('')}</select></td><td><input name="业务单位" value="${esc(user['业务单位'] || '')}"></td><td><input name="所属机房" value="${esc(user['所属机房'] || '')}"></td><td><div class="row-actions"><button class="mini delete" type="button" onclick="removeSystemUser(${index})">删除</button></div></td></tr>`).join('');
 }
 
-async function copyTokenText(text) {
+// HTTP 等非安全上下文里 navigator.clipboard 不可用，用隐藏 textarea + execCommand 兜底
+function legacyCopyText(text) {
+  const active = document.activeElement;
+  const sel = document.getSelection && document.getSelection();
+  const savedRange = sel && sel.rangeCount ? sel.getRangeAt(0).cloneRange() : null;
+  const ta = document.createElement('textarea');
+  ta.value = text;
+  ta.setAttribute('readonly', '');
+  ta.className = 'sm-copy-buffer';
+  ta.style.cssText = 'position:fixed;top:0;left:-9999px;opacity:0';
+  document.body.appendChild(ta);
+  let copied = false;
   try {
-    await navigator.clipboard.writeText(text);
-    toast('Token 已复制到剪贴板');
-  } catch (e) {
-    toast('复制失败，请手动选中复制', true);
+    ta.focus();
+    ta.select();
+    ta.setSelectionRange(0, text.length);
+    copied = !!document.execCommand && document.execCommand('copy');
+  } finally {
+    ta.remove();
+    if (active && active.focus) active.focus();
+    if (savedRange && sel) {
+      sel.removeAllRanges();
+      sel.addRange(savedRange);
+    }
   }
+  return copied;
+}
+
+async function copyTokenText(text) {
+  let copied = false;
+  try {
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      await navigator.clipboard.writeText(text);
+      copied = true;
+    }
+  } catch (e) {
+    copied = false;
+  }
+  if (!copied) copied = legacyCopyText(text);
+  toast(copied ? 'Token 已复制到剪贴板' : '复制失败，请手动选中复制', !copied);
 }
 
 function collectSystemUsers() {
