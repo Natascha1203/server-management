@@ -312,8 +312,10 @@ Token 不再需要手工写 `data/users.json`，也**不存在管理员代发**�
 - 轮转份数由设置 `auto_backup_keep` 控制（默认 20），与人工备份的 `backup_keep_count` 独立，
   互不挤占。
 - MCP 的写工具（`sm_upsert` / `sm_import_json` / `sm_delete` / `sm_review` / `sm_rack_submit` / `sm_rack_review`）
-  默认都带这个头，返回里的 `auto_backup` 就是本次改之前的快照名；设环境变量
-  `SM_AUTO_BACKUP=0` 可关闭。
+  默认都带这个头；**一个 MCP 客户端实例（= agent 一轮对话）只在第一次写时请求备份，整轮只留这一份
+  「操作前」快照，后续写复用同一份**，不再堆一串中间态。返回里的 `auto_backup` 全轮一致，
+  指向这一份；设环境变量 `SM_AUTO_BACKUP=0` 可关闭。
+  若首份因无效写（4xx）没留下，本轮后面的有效写会补做一次备份。
 
 **扫描**：`GET /api/snapshots`
 → `{"root":"...","exists":true,"scan_error":"","manual_dir":"...","auto_dir":"...","auto_backup_keep":20,

@@ -37,8 +37,11 @@ class SMClient:
         self.verify = os.environ.get("SM_INSECURE", "") not in ("1", "true", "True")
         # 写前自动备份开关；设 SM_AUTO_BACKUP=0 可关掉（后端磁盘紧张时用）
         self.auto_backup = os.environ.get("SM_AUTO_BACKUP", "1") not in ("0", "false", "False")
-        # 最近一次请求触发的自动备份名（空 = 没备份，可能是内容没变）
+        # 本轮（一个 SMClient 实例 = agent 一次 query）备份状态：
+        # last_auto_backup 一旦拿到就全轮保留，让所有写工具返回同一个「操作前」快照名；
+        # _backup_done 表示本轮已成功留过一份，后续写不再请求备份（避免一串中间包）。
         self.last_auto_backup = ""
+        self._backup_done = False
 
     # ---------------------------------------------------------------- 基础请求
 
@@ -63,14 +66,23 @@ class SMClient:
             headers["Content-Type"] = "application/json"
         if self.token:
             headers["Authorization"] = "Bearer " + self.token
-        # 写操作声明「改之前先备份」；后端会把实际生成的备份名回写在同名响应头里
-        self.last_auto_backup = ""
-        if self.auto_backup and method.upper() in WRITE_METHODS:
+        # 写前自动备份：一轮（一个 SMClient 实例）只请求一次，且只在首份成功留下后才算数。
+        # 后续写不再带这个头——否则每个写都各留一份「中间态」，撤回时得从一串包里挑最早那个。
+        # 若首份没留下（内容未变的 4xx/无效写被后端丢弃），保持未置位，让本轮后面的有效写补上。
+        want_backup = (
+            self.auto_backup and not self._backup_done and not self.last_auto_backup
+            and method.upper() in WRITE_METHODS
+        )
+        if want_backup:
             headers[AUTO_BACKUP_HEADER] = "1"
         request = urllib.request.Request(url, data=data, headers=headers, method=method)
         try:
             with urllib.request.urlopen(request, timeout=self.timeout, context=self._ssl_context()) as resp:
-                self.last_auto_backup = (resp.headers.get(AUTO_BACKUP_HEADER) or "").strip()
+                name = (resp.headers.get(AUTO_BACKUP_HEADER) or "").strip()
+                if want_backup and name:
+                    # 首份成功：记住名字并置位，本轮后续写复用它、不再备份
+                    self.last_auto_backup = name
+                    self._backup_done = True
                 return resp.read()
         except urllib.error.HTTPError as exc:
             raise SMError(self._describe_http_error(exc.code, exc.read(), path)) from None

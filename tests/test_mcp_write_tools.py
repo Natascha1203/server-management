@@ -854,31 +854,51 @@ class TestEndToEndWrite:
 
 
 class TestAutoBackupBeforeWrite:
-    """写工具必须让后端在落库前先备份——这是「MCP 改坏了能退回去」的唯一保障。"""
+    """一轮 agent 操作（一个 SMClient 实例）只在最开始留一份快照，全轮复用它当撤回点。"""
 
-    def test_write_returns_auto_backup_name(self, live):
+    def test_one_snapshot_per_round_reused_by_all_writes(self, live):
         from app import storage
+        from openpyxl import load_workbook
 
         client = api_client(live, "admin")
-        json.loads(mcp_tools.call_tool(
+        first = json.loads(mcp_tools.call_tool(
             "sm_upsert", {"entity": "customers", "row": {"客户id": "91000001", "名称": "备份验证"}}, client
         ))
-        created = json.loads(mcp_tools.call_tool(
+        second = json.loads(mcp_tools.call_tool(
             "sm_upsert", {"entity": "cabinets", "row": {"机房": "机房B", "机柜": "B01", "机位": "1-10"}}, client
         ))
-        # 第二次写才会真正产生「新内容」的备份（第一次写之后状态已变）
-        assert "auto_backup" in created, created
-        name = created["auto_backup"]
+        # 一轮只留一份，且两次写返回的都是同一份（整轮「操作前」的快照）
+        assert len(list(storage.auto_backup_dir().glob("B*"))) == 1
+        assert first.get("auto_backup") == second.get("auto_backup")
+        name = second["auto_backup"]
         assert name.startswith("B")
         backup_dir = storage.auto_backup_dir() / name
         assert backup_dir.is_dir()
-        # 备份里是写入前的状态：还没有这次新建的机柜
-        from openpyxl import load_workbook
+        # 快照是整轮操作前的状态：新建的客户、机柜都还没有
         wb = load_workbook(backup_dir / "机柜信息表.xlsx", data_only=True)
         cabinets = [row[0] for row in wb[wb.sheetnames[0]].iter_rows(min_row=2, values_only=True)]
         wb.close()
         assert "机房B" not in cabinets
-        assert "restore_hint" in created and "数据恢复" in created["restore_hint"]
+        wb = load_workbook(backup_dir / "客户表.xlsx", data_only=True)
+        cells = [c for row in wb[wb.sheetnames[0]].iter_rows(values_only=True) for c in row]
+        wb.close()
+        assert "备份验证" not in cells
+        assert "restore_hint" in second and "数据恢复" in second["restore_hint"]
+
+    def test_new_client_round_creates_another_snapshot(self, live):
+        """新一轮（新 SMClient 实例，对应 agent 新一次 query）会再留一份。"""
+        from app import storage
+
+        first_client = api_client(live, "admin")
+        first = json.loads(mcp_tools.call_tool(
+            "sm_upsert", {"entity": "customers", "row": {"客户id": "91000011", "名称": "轮一"}}, first_client
+        ))
+        second_client = api_client(live, "admin")
+        second = json.loads(mcp_tools.call_tool(
+            "sm_upsert", {"entity": "customers", "row": {"客户id": "91000012", "名称": "轮二"}}, second_client
+        ))
+        assert second["auto_backup"] != first["auto_backup"]
+        assert len(list(storage.auto_backup_dir().glob("B*"))) == 2
 
     def test_read_tools_do_not_trigger_backup(self, live):
         from app import storage
@@ -888,25 +908,22 @@ class TestAutoBackupBeforeWrite:
         mcp_tools.call_tool("sm_query", {"entity": "servers"}, client)
         assert not list(storage.auto_backup_dir().glob("B*"))
 
-    def test_delete_also_backed_up(self, live):
+    def test_delete_reuses_round_snapshot(self, live):
         from app import storage
 
         client = api_client(live, "admin")
-        json.loads(mcp_tools.call_tool(
-            "sm_upsert", {"entity": "customers", "row": {"客户id": "91000002", "名称": "待删"}}, client
-        ))
-        json.loads(mcp_tools.call_tool(
+        created = json.loads(mcp_tools.call_tool(
             "sm_upsert", {"entity": "cabinets", "row": {"机房": "机房C", "机柜": "C01", "机位": "1-10"}}, client
         ))
-        before = len(list(storage.auto_backup_dir().glob("B*")))
         deleted = json.loads(mcp_tools.call_tool(
             "sm_delete", {"entity": "cabinets", "keys": [{"机房": "机房C", "机柜": "C01"}],
                           "confirm_keys": [{"机房": "机房C", "机柜": "C01"}]},
             client,
         ))
         assert deleted["applied"] is True, deleted
-        assert deleted.get("auto_backup"), deleted
-        assert len(list(storage.auto_backup_dir().glob("B*"))) == before + 1
+        # 整轮仍只有一份，delete 复用首份作为退路，不再额外堆一份中间态
+        assert deleted.get("auto_backup") == created["auto_backup"]
+        assert len(list(storage.auto_backup_dir().glob("B*"))) == 1
 
     def test_env_can_disable_auto_backup(self, live, monkeypatch):
         """SM_AUTO_BACKUP=0 时不带这个头（磁盘紧张时的逃生口）。"""
